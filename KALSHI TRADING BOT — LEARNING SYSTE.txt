@@ -1,0 +1,173 @@
+KALSHI TRADING BOT — COMPLETE REFERENCE
+========================================
+
+OVERVIEW
+--------
+A fully autonomous multi-agent prediction market trading bot for Kalshi.
+Scans thousands of markets, researches candidates using news/sentiment,
+estimates probabilities, manages risk with Kelly criterion, places live
+orders with smart limit pricing, monitors positions for early exits,
+and learns from every trade outcome to improve over time.
+
+Mode: Live or Paper trading
+API: Kalshi v2 (RSA-PSS signed authentication)
+Language: Python 3.13 | Data: SQLite | Sentiment: FinBERT + VADER
+
+
+PIPELINE (every cycle)
+----------------------
+SCAN → RESEARCH → PREDICT → RISK → EXECUTE → MONITOR SETTLEMENTS → POSITION MONITOR → POSTMORTEM → SLEEP → REPEAT
+
+Default cycle interval: 300 seconds (5 minutes)
+
+
+7 AGENTS
+--------
+
+1. SCAN AGENT
+   - Fetches all active Kalshi markets (up to 5,000)
+   - Filters: min volume, min liquidity, time to resolution, zero-price
+   - Compares current prices/volume to rolling baselines (snapshots)
+   - Fires signals: wide_spread, price_move, volume_spike, divergence, new_high_activity
+   - Filters out combo/MVE markets (strike_type == "custom")
+   - Applies learned signal adjustments and category biases
+   - Ranks candidates by signal_count × category_bias
+   - Output: list of CandidateMarket objects with signals
+
+2. RESEARCH AGENT
+   - Runs in parallel (4 threads per batch, 4 threads per data source)
+   - Data sources: NewsAPI/RSS, web scraper, Twitter, Reddit (optional)
+   - Sentiment: two-tier pipeline — VADER on all data points, FinBERT on top-N by engagement
+   - Optional Claude narrative summarization
+   - Output: ResearchResult with sentiment score (-1 to +1), confidence, narrative
+
+3. PREDICTION AGENT
+   - Heuristic probability model (V1 — no ML training needed)
+   - Starts with market-implied probability (mid-price)
+   - Adjusts for: sentiment shift, evidence volume, learned heuristics
+   - Applies per-category sentiment discounts (from postmortem learning)
+   - Minimum edge threshold: 3% (configurable)
+   - Output: PredictionResult with true_probability, edge, confidence
+
+4. RISK AGENT
+   - Fractional Kelly criterion for position sizing (default: quarter-Kelly)
+   - Max exposure: 5% of bankroll per trade
+   - Smart limit pricing: places orders inside the spread using learned aggression
+   - Gates: negative Kelly, position too small (<$1), low confidence, duplicates, liquidity cap (10%)
+   - Fetches live balance from Kalshi each cycle
+   - Output: TradeDecision (approved/rejected with reasoning)
+
+5. EXECUTION AGENT
+   - Places live orders via Kalshi API or records paper trades
+   - Monitors open orders for fill status (filled, partial, missed)
+   - Monitors settled markets and resolves trades (won/lost with P&L)
+   - Tracks signal wins for scan agent learning
+   - Output: trade records in SQLite, fill rate data for learning
+
+6. POSITION MONITOR AGENT
+   - Checks every open position each cycle for early exit opportunities
+   - Four exit triggers:
+     * Take Profit — unrealized gain >= 40% of max possible gain
+     * Stop Loss — unrealized loss >= 50% of entry cost
+     * Edge Reversed — current edge flipped below -1%
+     * Time Decay — <4 hours to expiry tightens TP to 20%, SL to 25%
+   - Sells positions via Kalshi API (action="sell")
+   - Records exit data for regret analysis
+   - All thresholds are learned and adjusted over time
+
+7. POSTMORTEM AGENT
+   - Runs on every resolved trade (record_outcome for all, deep analysis for losses)
+   - Checks: probability estimate accuracy, sentiment direction, timing, position sizing
+   - Updates heuristics: signal wins/losses, category avoidance, sentiment discounts
+   - Exit regret analysis: compares early-exit P&L vs hold-to-settlement P&L
+   - Optional Claude-powered loss analysis
+   - Output: postmortem records, heuristic updates for all other agents
+
+
+6 LEARNING SYSTEMS
+------------------
+
+All learning is driven by trade outcomes, not time. The bot starts permissive and tightens over time.
+
+1. SIGNAL EFFECTIVENESS
+   Source: Scan Agent | Learns from: Wins + Losses
+   - Tracks signal_wins_<name> and signal_losses_<name> per signal
+   - < 2 trades: no adjustment (default thresholds)
+   - >= 2 trades: tightens proportionally — adjustment = loss_rate × 0.5
+   - >= 4 trades with >= 75% loss rate: signal fully suppressed
+   - Loaded: start of every scan cycle
+
+2. CATEGORY PROFITABILITY
+   Source: Scan Agent + Postmortem | Learns from: Wins + Losses
+   - Tracks cat_wins_<category>, cat_pnl_<category>, losses_<category>
+   - < 2 trades: neutral (1.0× bias)
+   - >= 2 trades: bias 0.1× to 2.0× based on win rate + P&L direction
+   - >= 5 losses: category flagged for total avoidance
+   - Candidates ranked by signal_count × category_bias
+   - Loaded: start of every scan cycle
+
+3. ORDER FILL RATE / AGGRESSION
+   Source: Execution Agent | Learns from: Order fills & misses
+   - Tracks order_fills, order_misses, order_partials
+   - < 3 orders: default aggression 0.40 (slightly patient)
+   - Fill rate > 80%: decrease aggression by 0.05 (min 0.30)
+   - Fill rate < 50%: increase aggression by 0.05 (max 0.95)
+   - Fill rate 50-80%: no change (target ~70%)
+   - Loaded: every time a limit price is calculated
+
+4. SENTIMENT DISCOUNT
+   Source: Postmortem → Probability Model | Learns from: Losses only
+   - When sentiment was directionally wrong, increments sentiment_discount_<category> by 0.05
+   - Caps at 0.50 (reduces sentiment weight from 10% down to 1%)
+   - effective_weight = max(0.01, 0.10 - discount)
+   - Loaded: every prediction
+
+5. PROBABILITY HEURISTIC ADJUSTMENTS
+   Source: Postmortem → Probability Model | Learns from: Losses only
+   - Stores per-ticker probability adjustments as JSON
+   - Records patterns: sentiment_misleading, late_entry, overconfident_estimate, oversized_position
+   - Loaded: bot startup
+
+6. EXIT THRESHOLD TUNING
+   Source: Position Monitor + Postmortem | Learns from: Early exits vs settlement
+   - After early exit, stores exit data; when market settles, compares exit P&L vs hold P&L
+   - Produces regret rate (how often holding would have been better)
+   - TP regret > 60%: raise TP threshold (exiting too early)
+   - TP regret < 25%: lower TP threshold (exits well-timed)
+   - SL regret > 50%: raise SL threshold (give more room)
+   - SL regret < 20%: lower SL threshold (stops saving money)
+   - Loaded: start of every position monitor cycle
+
+
+SUMMARY TABLE
+-------------
+System                  | Learns from      | Min data | Effect                              | Frequency
+Signal effectiveness    | Wins + Losses    | 2 trades | 0-50% tighter, or suppression at 4+ | Every scan
+Category profitability  | Wins + Losses    | 2 trades | 0.1x-2.0x priority, or avoidance    | Every scan
+Fill rate / aggression  | Fills & misses   | 3 orders | 0.30-0.95 aggression factor         | Every order
+Sentiment discount      | Losses only      | 1 loss   | 0-50% reduction in sentiment weight | Every prediction
+Probability adjustment  | Losses only      | 1 loss   | Direct probability shift per ticker | Bot startup
+Exit threshold tuning   | Exits vs settle  | 3 exits  | TP 25-80%, SL 30-75% thresholds    | Every cycle
+
+
+CONFIGURATION (via .env)
+------------------------
+MODE                          paper / live
+BANKROLL                      starting bankroll ($)
+SCAN_INTERVAL_SECONDS         cycle interval (default 300)
+MIN_VOLUME_24H                minimum 24h volume (default 50)
+MIN_LIQUIDITY_DOLLARS         minimum liquidity (default $100)
+MAX_TIME_TO_RESOLUTION_DAYS   max days to expiry (default 45)
+WIDE_SPREAD_CENTS             spread signal threshold (default 4c)
+PRICE_MOVE_THRESHOLD_PCT      price move signal (default 7%)
+MIN_EDGE_THRESHOLD            minimum edge to trade (default 3%)
+MAX_EXPOSURE_PCT              max bankroll per trade (default 5%)
+KELLY_FRACTION                Kelly multiplier (default 0.25)
+
+
+KEY TAKEAWAY
+------------
+The bot starts permissive and tightens over time. All learning is driven by
+trade outcomes, not by the passage of time or number of cycles. Until the bot
+places trades and those trades resolve, no learning happens. For markets that
+take days or weeks to resolve, the learning loop is naturally slow.

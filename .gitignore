@@ -1,0 +1,27 @@
+# Secrets
+.env
+*.pem
+*.key
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
