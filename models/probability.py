@@ -102,7 +102,7 @@ class ProbabilityModel:
 
         # Adjustment 1: Sentiment-based shift (reduced if sentiment was
         # historically misleading for this market category)
-        category = market_ticker[:4] if market_ticker else ""
+        category = market_ticker[:7] if market_ticker else ""
         discount = self._sentiment_discounts.get(category, 0.0)
         effective_weight = max(0.01, self.SENTIMENT_WEIGHT - discount)
         sentiment_shift = sentiment_score * effective_weight * confidence_mult

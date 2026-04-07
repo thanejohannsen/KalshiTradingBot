@@ -212,10 +212,30 @@ class KalshiAPIClient:
         logger.info("Fetched %d active markets from %d event pages", len(all_markets), page)
         return all_markets
 
+    _event_category_cache: dict[str, str] = {}
+
     def get_market(self, ticker: str) -> MarketData:
         data = self._call_with_retry("GET", f"/markets/{ticker}", auth=False)
         market = data.get("market", data)
-        return self._parse_market(market)
+        parsed = self._parse_market(market)
+        # Single-market endpoint often lacks category — fetch from event if missing
+        if not parsed.category and parsed.event_ticker:
+            et = parsed.event_ticker
+            if et in self._event_category_cache:
+                parsed.category = self._event_category_cache[et]
+            else:
+                try:
+                    evt = self._call_with_retry(
+                        "GET", f"/events/{et}", auth=False,
+                    )
+                    event = evt.get("event", evt)
+                    cat = event.get("category", "")
+                    self._event_category_cache[et] = cat
+                    if cat:
+                        parsed.category = cat
+                except Exception:
+                    pass
+        return parsed
 
     def get_orderbook(self, ticker: str, depth: int = 10) -> dict[str, Any]:
         data = self._call_with_retry(
@@ -227,14 +247,17 @@ class KalshiAPIClient:
         }
 
     def get_market_history(
-        self, ticker: str, series_ticker: str, period: str = "1h", limit: int = 100
+        self, ticker: str, series_ticker: str, period_interval: int = 60
     ) -> list[dict[str, Any]]:
         """Fetch candlestick data for historical baseline."""
         try:
+            import time
+            now = int(time.time())
+            start_ts = now - 86400  # 24 hours ago
             data = self._call_with_retry(
                 "GET",
                 f"/series/{series_ticker}/markets/{ticker}/candlesticks",
-                params={"period": period},
+                params={"period_interval": period_interval, "start_ts": start_ts, "end_ts": now},
                 auth=False,
             )
             return data.get("candlesticks", [])
@@ -303,6 +326,71 @@ class KalshiAPIClient:
             )
         return parsed
 
+    def get_position_count(self, ticker: str, side: str) -> int:
+        """Return the number of contracts we actually hold for ticker+side on Kalshi.
+
+        This is the source of truth — always call before selling to prevent
+        overselling (which Kalshi treats as opening an opposite position).
+        """
+        try:
+            positions = self.get_positions()
+            for p in positions:
+                if p.get("ticker") == ticker:
+                    if side == "yes":
+                        return int(p.get("yes_count", 0) or 0)
+                    else:
+                        return int(p.get("no_count", 0) or 0)
+        except Exception as exc:
+            logger.warning("Could not verify position for %s: %s", ticker, exc)
+            # Fail safe: return 0 so the sell is blocked
+            return 0
+        return 0
+
+    # ------------------------------------------------------------------
+    # Fills  (authenticated)
+    # ------------------------------------------------------------------
+    def get_fills(self, ticker: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        """Fetch portfolio fills (actual execution records).
+
+        This is the most reliable source of entry prices — it returns the
+        actual price and count for each fill, unlike orders which show the
+        order price (which may differ from the execution price).
+        """
+        fills: list[dict[str, Any]] = []
+        cursor: str | None = None
+
+        while True:
+            params: dict[str, Any] = {"limit": limit}
+            if ticker:
+                params["ticker"] = ticker
+            if cursor:
+                params["cursor"] = cursor
+
+            data = self._call_with_retry("GET", "/portfolio/fills", params=params)
+            batch = data.get("fills", [])
+
+            for f in batch:
+                price = _parse_dollar_field(
+                    f.get("yes_price_dollars") if f.get("side") == "yes" else f.get("no_price_dollars"),
+                    f.get("yes_price") if f.get("side") == "yes" else f.get("no_price"),
+                )
+                count = _parse_count_field(f.get("count_fp"), f.get("count"))
+                fills.append({
+                    "ticker": f.get("ticker", ""),
+                    "side": f.get("side", ""),
+                    "action": f.get("action", ""),
+                    "price": price,
+                    "count": count,
+                    "order_id": f.get("order_id", ""),
+                    "created_time": f.get("created_time", ""),
+                })
+
+            cursor = data.get("cursor")
+            if not cursor or len(batch) < limit:
+                break
+
+        return fills
+
     # ------------------------------------------------------------------
     # Orders  (authenticated)
     # ------------------------------------------------------------------
@@ -315,7 +403,31 @@ class KalshiAPIClient:
         price: float | None = None,
         order_type: str = "limit",
     ) -> dict[str, Any]:
-        """Place an order on Kalshi."""
+        """Place an order on Kalshi.
+
+        SAFETY: For sell orders, we verify against the Kalshi positions API
+        that we actually hold enough contracts. If we hold fewer than requested,
+        the count is clamped down. If we hold zero, the sell is blocked entirely.
+        This prevents overselling, which Kalshi treats as opening an opposite
+        position (e.g., selling YES you don't own = buying NO).
+        """
+        if action == "sell":
+            held = self.get_position_count(ticker, side)
+            if held <= 0:
+                logger.error(
+                    "SELL BLOCKED: %s %s x%d — Kalshi shows 0 contracts held. "
+                    "Refusing to sell to prevent opening opposite position.",
+                    side, ticker, count,
+                )
+                return {"order_id": None, "status": "blocked_no_position"}
+            if count > held:
+                logger.warning(
+                    "SELL CAPPED: %s %s requested x%d but only x%d held on Kalshi. "
+                    "Capping to x%d to prevent overselling.",
+                    side, ticker, count, held, held,
+                )
+                count = held
+
         body: dict[str, Any] = {
             "ticker": ticker,
             "action": action,

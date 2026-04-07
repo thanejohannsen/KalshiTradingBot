@@ -1,23 +1,18 @@
 """
-POSITION MONITOR AGENT — watches open positions and exits early when warranted.
+POSITION MONITOR AGENT - watches open positions and exits early when warranted.
 
 Runs every cycle after the execution agent's settlement check.  Evaluates
 each open position for:
 
-  1. TAKE PROFIT  — price moved in our favor past a dynamic threshold
-  2. STOP LOSS    — price moved against us past a dynamic threshold
-  3. EDGE GONE    — the original edge has evaporated or reversed
-  4. TIME DECAY   — market is approaching expiry with shrinking edge
+  1. TRAILING STOP     - tracks high-water mark; exits when price drops trail_pct
+                         from peak while profitable (default 8%, learnable)
+  2. CATASTROPHIC LOSS - exits if position lost >50% of entry cost
+  3. EDGE GONE         - the original edge has reversed (near expiry only)
+  4. TIME DECAY        - market is approaching expiry, lock in gains or cut losses
 
-All thresholds are learned from past exits via heuristics:
-
-  exit_tp_threshold     — take-profit trigger (default 40% of max possible gain)
-  exit_sl_threshold     — stop-loss trigger   (default 50% of entry cost)
-  exit_tp_wins          — how many take-profit exits were ultimately correct
-  exit_tp_losses        — take-profit exits where holding would have been better
-  exit_sl_wins          — stop-loss exits where the market did go against us
-  exit_sl_losses        — stop-loss exits where the market would have recovered
-  exit_edge_gone_count  — exits due to edge reversal
+Kalshi has no stop/conditional order type.  Resting sell orders below the
+bid fill instantly (they are just market sells).  All exit logic runs via
+active polling and immediate sell orders.
 """
 
 from __future__ import annotations
@@ -25,7 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any
 
 from config import Config
@@ -36,10 +31,15 @@ from utils import MarketData
 logger = logging.getLogger("kalshi_bot.position_monitor")
 
 # Defaults — will be overridden by learned values
-DEFAULT_TP_THRESHOLD = 0.40   # exit when unrealized gain >= 40% of max gain
-DEFAULT_SL_THRESHOLD = 0.50   # exit when unrealized loss >= 50% of entry cost
-DEFAULT_EDGE_MIN = 0.01       # exit if remaining edge drops below 1%
+DEFAULT_TRAIL_PCT = 0.20      # trailing stop: exit when price drops 20% from peak
+                              # binary markets swing 10-20% on noise; 8% was way too tight
+DEFAULT_EDGE_MIN = 0.03       # exit if edge reversed by 3%+ (was 1% — too sensitive)
 DEFAULT_TIME_DECAY_HOURS = 4  # more aggressive exits when < 4h to close
+MIN_HOLD_MINUTES = 30         # don't exit on edge reversal until held at least 30 min
+TRAIL_PCT_FLOOR = 0.10        # postmortem can't tighten trail below 10%
+TRAIL_PCT_CEILING = 0.40      # postmortem can't widen trail above 40%
+CATASTROPHIC_LOSS_PCT = 0.50  # exit if position lost >50% of entry cost
+MIN_PROFIT_TO_TRAIL = 0.15    # trailing stop only activates when position is 15%+ above entry
 
 
 class PositionMonitorAgent:
@@ -54,8 +54,7 @@ class PositionMonitorAgent:
         self._kalshi = kalshi
 
         # Learned thresholds — loaded each cycle
-        self._tp_threshold = DEFAULT_TP_THRESHOLD
-        self._sl_threshold = DEFAULT_SL_THRESHOLD
+        self._trail_pct = DEFAULT_TRAIL_PCT
         self._exit_aggression = 0.70
 
     # ------------------------------------------------------------------
@@ -94,6 +93,10 @@ class PositionMonitorAgent:
         exit_reason_counts: dict[str, int] = {}
 
         for trade in open_trades:
+            # Skip manually placed trades — bot must not touch them
+            if trade.get("manual"):
+                continue
+
             ticker = trade["ticker"]
             try:
                 monitor_trade, state = self._get_monitorable_trade(
@@ -271,93 +274,124 @@ class PositionMonitorAgent:
         side = trade["side"]
         entry_price = trade["entry_price"]
         contracts = trade.get("size_contracts", 1)
-        spread_at_entry = float(trade.get("spread_at_entry") or 0.0)
-        tp_progress: float | None = None
-        sl_progress: float | None = None
         current_edge: float | None = None
         hours_left: float | None = None
-        has_live_tp = bool(trade.get("tp_order_id"))
-        has_live_sl = bool(trade.get("sl_order_id"))
 
         # Current value of our position
         if side == "yes":
-            # We own YES contracts — they're worth the current yes_bid
             current_price = market.yes_bid if market.yes_bid > 0 else market.last_price
-            # Max gain = $1 - entry, max loss = entry
             max_gain = (1.0 - entry_price) * contracts
             unrealized_pnl = (current_price - entry_price) * contracts
         else:
-            # We own NO contracts — they're worth the current no_bid (= 1 - yes_ask)
             current_price = market.no_bid if market.no_bid > 0 else (1.0 - market.last_price)
             max_gain = (1.0 - entry_price) * contracts
             unrealized_pnl = (current_price - entry_price) * contracts
 
-        # Spread-adjusted cost basis: the bid-ask spread is not a real loss —
-        # we immediately "lose" it just by buying, so we exclude it from the
-        # stop-loss reference price.  If spread_at_entry=0 (old trades), this
-        # is identical to the original logic.
-        sl_basis = max(0.01, entry_price - spread_at_entry)
-        max_loss = sl_basis * contracts
+        # ── CHECK 1: TRAILING STOP ──────────────────────────────────
+        # Track the high-water mark (peak price since entry).
+        # Once the position has gained enough (MIN_PROFIT_TO_TRAIL above
+        # entry), if price drops trail_pct from the peak, exit to lock
+        # in gains.  The minimum profit gate prevents the trail from
+        # triggering on tiny run-ups that are just noise in binary markets.
+        high_water = float(trade.get("high_water_mark") or entry_price)
+        if current_price > high_water:
+            high_water = current_price
+            self._db.update_high_water_mark(trade["id"], high_water)
 
-        # Absolute trigger levels (in per-contract price terms)
-        tp_trigger_price = entry_price + self._tp_threshold * (1.0 - entry_price)
-        sl_trigger_price = sl_basis - self._sl_threshold * sl_basis
-        tp_trigger_price = max(0.0, min(1.0, tp_trigger_price))
-        sl_trigger_price = max(0.0, min(1.0, sl_trigger_price))
+        trail_drop = 0.0
+        # Require the peak to have exceeded entry by MIN_PROFIT_TO_TRAIL
+        # before the trailing stop is armed.  This prevents exits on tiny
+        # run-ups (e.g., entry $0.62, peak $0.72, 8% trail → exit at $0.66
+        # for a pathetic $0.04 profit per contract).
+        profit_from_entry = (high_water - entry_price) / entry_price if entry_price > 0 else 0
+        trail_armed = profit_from_entry >= MIN_PROFIT_TO_TRAIL
 
-        # ── CHECK 1: TAKE PROFIT ────────────────────────────────────
-        if max_gain > 0 and unrealized_pnl > 0:
-            gain_pct = unrealized_pnl / max_gain
-            tp_progress = gain_pct
-            if gain_pct >= self._tp_threshold:
-                if has_live_tp:
-                    return None
+        if trail_armed and current_price > entry_price:
+            # Position has had a meaningful run-up — check if price dropped from peak
+            trail_drop = (high_water - current_price) / high_water
+            if trail_drop >= self._trail_pct:
+                profit_captured = current_price - entry_price
+                potential = 1.0 - entry_price
+                pct_captured = (profit_captured / potential * 100) if potential > 0 else 0
                 logger.info(
-                    "  TP trigger: %s | pnl=$%.2f (%.0f%% of max $%.2f) | threshold=%.0f%%",
-                    ticker, unrealized_pnl, gain_pct * 100,
-                    max_gain, self._tp_threshold * 100,
+                    "  TRAILING STOP: %s | peak=$%.2f → now=$%.2f (drop=%.1f%%, trail=%.1f%%) | "
+                    "captured $%.2f/contract (%.0f%% of potential)",
+                    ticker, high_water, current_price,
+                    trail_drop * 100, self._trail_pct * 100,
+                    profit_captured, pct_captured,
                 )
-                return ("take_profit", current_price)
+                return ("trailing_stop", current_price)
 
-        # ── CHECK 2: STOP LOSS (spread-adjusted) ───────────────────
-        # Measure loss from sl_basis (entry minus spread) so the bid-ask
-        # spread alone does not trip the stop loss on thin markets.
-        adjusted_pnl = (current_price - sl_basis) * contracts
-        if max_loss > 0 and adjusted_pnl < 0:
-            loss_pct = abs(adjusted_pnl) / max_loss
-            sl_progress = loss_pct
-            if loss_pct >= self._sl_threshold:
-                if has_live_sl:
-                    return None
+        # ── CHECK 2: CATASTROPHIC LOSS ─────────────────────────────
+        # If the position has lost more than 50% of its entry cost,
+        # salvage remaining value rather than riding to zero.
+        if unrealized_pnl < 0 and entry_price > 0:
+            loss_pct = abs(unrealized_pnl) / (entry_price * contracts)
+            if loss_pct >= CATASTROPHIC_LOSS_PCT:
                 logger.info(
-                    "  SL trigger: %s | loss=$%.2f (%.0f%% of adj-basis $%.2f) | "
-                    "threshold=%.0f%% | spread_adj=$%.3f",
-                    ticker, adjusted_pnl, loss_pct * 100,
-                    max_loss, self._sl_threshold * 100, spread_at_entry,
+                    "  CATASTROPHIC LOSS: %s | entry=$%.2f → now=$%.2f | "
+                    "loss=$%.2f (%.0f%% of entry) — cutting losses",
+                    ticker, entry_price, current_price,
+                    unrealized_pnl, loss_pct * 100,
                 )
-                return ("stop_loss", current_price)
+                return ("catastrophic_loss", current_price)
 
-        # ── CHECK 3: EDGE GONE ──────────────────────────────────────
+        # ── CHECK 3: EDGE GONE (near expiry only) ──────────────────
+        # Only exit on edge reversal near close.  Far from close, normal
+        # price noise on cheap contracts easily reverses the raw edge —
+        # a 2c move on a 18c contract flips the sign.  That's noise,
+        # not a thesis failure.
+        #
+        # Minimum hold time prevents entering and exiting in the same cycle.
         original_edge = trade.get("edge") or 0
         if original_edge != 0:
-            # Recalculate current edge: how far is current price from our entry
-            if side == "yes":
-                # We bought YES at entry_price. Current mid = market mid.
-                current_mid = market.mid_price
-                current_edge = current_mid - entry_price
-            else:
-                current_mid = 1.0 - market.mid_price
-                current_edge = current_mid - entry_price
+            # Enforce minimum hold time — don't edge-exit a brand-new position
+            opened_at = trade.get("opened_at")
+            held_long_enough = True
+            if opened_at:
+                try:
+                    t_open = datetime.fromisoformat(
+                        str(opened_at).replace("Z", "+00:00")
+                    )
+                    minutes_held = (datetime.now(timezone.utc) - t_open).total_seconds() / 60
+                    held_long_enough = minutes_held >= MIN_HOLD_MINUTES
+                except (ValueError, TypeError):
+                    pass
 
-            # Exit if edge has reversed (we're now on the wrong side)
-            if original_edge > 0 and current_edge < -DEFAULT_EDGE_MIN:
-                logger.info(
-                    "  Edge reversed: %s | original_edge=%.3f → current=%.3f",
-                    ticker, original_edge, current_edge,
-                )
-                return ("edge_reversed", current_price)
+            if held_long_enough:
+                if side == "yes":
+                    current_mid = market.mid_price
+                    current_edge = current_mid - entry_price
+                else:
+                    current_mid = 1.0 - market.mid_price
+                    current_edge = current_mid - entry_price
 
-        # ── CHECK 4: TIME DECAY — tighten thresholds near expiry ───
+                # Scale the reversal threshold by time remaining:
+                #   < 2h  : exit on reversal > 3% (converging but not hair-trigger)
+                #   2-12h : exit on reversal > 60% of original edge
+                #   > 12h : don't exit on edge reversal at all (too noisy)
+                edge_exit_ok = False
+                close_time_str_edge = market.close_time
+                if close_time_str_edge:
+                    try:
+                        ct = datetime.fromisoformat(close_time_str_edge.replace("Z", "+00:00"))
+                        hrs = (ct - datetime.now(timezone.utc)).total_seconds() / 3600
+                        if hrs <= 2:
+                            edge_exit_ok = current_edge < -DEFAULT_EDGE_MIN
+                        elif hrs <= 12:
+                            reversal_threshold = max(DEFAULT_EDGE_MIN, abs(original_edge) * 0.60)
+                            edge_exit_ok = current_edge < -reversal_threshold
+                    except (ValueError, TypeError):
+                        pass
+
+                if edge_exit_ok:
+                    logger.info(
+                        "  Edge reversed: %s | original_edge=%.3f -> current=%.3f",
+                        ticker, original_edge, current_edge,
+                    )
+                    return ("edge_reversed", current_price)
+
+        # ── CHECK 4: TIME DECAY — lock in gains OR cut losses near expiry
         close_time_str = market.close_time
         if close_time_str:
             try:
@@ -368,22 +402,9 @@ class PositionMonitorAgent:
                 hours_left = (close_time - now).total_seconds() / 3600
 
                 if 0 < hours_left < DEFAULT_TIME_DECAY_HOURS:
-                    # Near expiry with a loss — cut it (also spread-adjusted)
-                    if adjusted_pnl < 0:
-                        loss_pct = abs(adjusted_pnl) / max_loss if max_loss > 0 else 0
-                        # Tighter stop: 25% loss near expiry
-                        if loss_pct >= 0.25:
-                            logger.info(
-                                "  Time decay exit: %s | %.1fh left | loss=$%.2f (%.0f%%)",
-                                ticker, hours_left,
-                                unrealized_pnl, loss_pct * 100,
-                            )
-                            return ("time_decay_stop", current_price)
-
-                    # Near expiry with small gain — lock it in
+                    # Near expiry with a gain — lock it in with tighter TP
                     if unrealized_pnl > 0 and max_gain > 0:
                         gain_pct = unrealized_pnl / max_gain
-                        # Tighter TP: 20% gain near expiry
                         if gain_pct >= 0.20:
                             logger.info(
                                 "  Time decay take-profit: %s | %.1fh left | gain=$%.2f (%.0f%%)",
@@ -391,20 +412,40 @@ class PositionMonitorAgent:
                                 unrealized_pnl, gain_pct * 100,
                             )
                             return ("time_decay_tp", current_price)
+
+                    # Near expiry with a significant loss — cut it.
+                    # With < 2h left, a position losing > 40% of entry cost
+                    # is unlikely to recover.  With < 1h, cut at 25%.
+                    # We can still recoup partial value by selling now rather
+                    # than holding to resolution for a total loss.
+                    if unrealized_pnl < 0 and entry_price > 0:
+                        loss_pct = abs(unrealized_pnl) / (entry_price * contracts)
+                        if hours_left < 1.0 and loss_pct >= 0.25:
+                            logger.info(
+                                "  Time decay loss-cut: %s | %.1fh left | "
+                                "loss=$%.2f (%.0f%% of entry) — cutting near expiry",
+                                ticker, hours_left,
+                                unrealized_pnl, loss_pct * 100,
+                            )
+                            return ("time_decay_loss", current_price)
+                        elif hours_left < 2.0 and loss_pct >= 0.40:
+                            logger.info(
+                                "  Time decay loss-cut: %s | %.1fh left | "
+                                "loss=$%.2f (%.0f%% of entry) — cutting near expiry",
+                                ticker, hours_left,
+                                unrealized_pnl, loss_pct * 100,
+                            )
+                            return ("time_decay_loss", current_price)
             except (ValueError, TypeError):
                 pass
 
         # Explain hold decision so monitoring behavior is transparent.
-        tp_msg = (
-            f"TP progress {tp_progress * 100:.0f}%/{self._tp_threshold * 100:.0f}%"
-            if tp_progress is not None
-            else f"TP progress inactive (needs gain)/{self._tp_threshold * 100:.0f}%"
-        )
-        sl_msg = (
-            f"SL progress {sl_progress * 100:.0f}%/{self._sl_threshold * 100:.0f}%"
-            if sl_progress is not None
-            else f"SL progress inactive (needs loss)/{self._sl_threshold * 100:.0f}%"
-        )
+        if trail_armed and current_price > entry_price:
+            trail_msg = f"trail ARMED drop={trail_drop * 100:.1f}%/{self._trail_pct * 100:.0f}%"
+        elif profit_from_entry > 0:
+            trail_msg = f"trail waiting (run-up={profit_from_entry * 100:.0f}%, need {MIN_PROFIT_TO_TRAIL * 100:.0f}%)"
+        else:
+            trail_msg = f"trail inactive (underwater) trail={self._trail_pct * 100:.0f}%"
         edge_msg = (
             f"edge {current_edge:+.3f}" if current_edge is not None else "edge n/a"
         )
@@ -412,21 +453,16 @@ class PositionMonitorAgent:
             f"{hours_left:.1f}h to expiry" if hours_left is not None else "expiry unknown"
         )
         if log_holds:
-            spread_suffix = f" spread=${spread_at_entry:.3f}" if spread_at_entry > 0 else ""
             logger.info(
-                "  HOLD: %s | px=%.2f entry=%.2f basis=%.2f | tp_px>=%.2f sl_px<=%.2f | pnl=$%.2f | %s | %s | %s | %s%s",
+                "  HOLD: %s | px=%.2f entry=%.2f peak=%.2f | pnl=$%.2f | %s | %s | %s",
                 ticker,
                 current_price,
                 entry_price,
-                sl_basis,
-                tp_trigger_price,
-                sl_trigger_price,
+                high_water,
                 unrealized_pnl,
-                tp_msg,
-                sl_msg,
+                trail_msg,
                 edge_msg,
                 time_msg,
-                spread_suffix,
             )
 
         return None  # Hold position
@@ -446,6 +482,35 @@ class PositionMonitorAgent:
         side = trade["side"]
         contracts = trade.get("size_contracts", 1)
         entry_price = trade["entry_price"]
+
+        # SAFETY: Verify we actually hold these contracts on Kalshi before
+        # attempting to sell. Prevents overselling after restarts or if
+        # another sell path already closed the position.
+        if self._cfg.is_live:
+            held = self._kalshi.get_position_count(ticker, side)
+            if held <= 0:
+                logger.warning(
+                    "SKIP EXIT: %s — Kalshi shows 0 %s contracts held. "
+                    "Position may already be closed.",
+                    ticker, side,
+                )
+                return False
+            if held < contracts:
+                logger.warning(
+                    "EXIT CAPPED: %s — DB says x%d but Kalshi only has x%d. Using x%d.",
+                    ticker, contracts, held, held,
+                )
+                contracts = held
+
+        # Don't try to sell at extreme prices — just let the market settle.
+        # Selling at 1-2c recovers almost nothing and often won't fill anyway.
+        # Selling at 98-99c gives up the last 1-2c for no reason.
+        if current_price <= 0.03 or current_price >= 0.97:
+            logger.info(
+                "  SKIP EXIT: %s | price=%.2f too extreme — letting market settle",
+                ticker, current_price,
+            )
+            return False
 
         self._cancel_trade_brackets(trade)
 
@@ -625,6 +690,8 @@ class PositionMonitorAgent:
             "reason": reason,
             "entry_price": trade["entry_price"],
             "exit_price": exit_price,
+            "high_water_mark": float(trade.get("high_water_mark") or exit_price),
+            "trail_pct_used": self._trail_pct,
             "pnl": round(pnl, 2),
             "side": trade["side"],
         }
@@ -641,18 +708,12 @@ class PositionMonitorAgent:
     # Threshold learning
     # ------------------------------------------------------------------
     def _load_learned_thresholds(self, log_output: bool = True) -> None:
-        """
-        Adjust TP/SL thresholds based on whether past exits were good decisions.
+        """Load learned trailing-stop percentage and exit aggression.
 
-        Logic:
-          - If take-profit exits are mostly profitable AND we're not leaving
-            too much on the table → keep or tighten TP threshold
-          - If take-profit exits often miss bigger gains → loosen TP threshold
-          - If stop-loss exits prevent bigger losses → keep or tighten SL
-          - If stop-loss exits keep cutting winners → loosen SL threshold
+        The trail_pct heuristic is adjusted by the postmortem agent based
+        on regret analysis of past trailing-stop exits.
         """
-        self._tp_threshold = DEFAULT_TP_THRESHOLD
-        self._sl_threshold = DEFAULT_SL_THRESHOLD
+        self._trail_pct = DEFAULT_TRAIL_PCT
         self._exit_aggression = 0.70
 
         # Separate aggression for exits: default more aggressive than entries
@@ -663,106 +724,18 @@ class PositionMonitorAgent:
             except (ValueError, TypeError):
                 pass
 
-        # ── Take-profit threshold learning ──────────────────────────
-        tp_count_raw = self._db.get_heuristic("exit_take_profit_count")
-        tp_count = int(tp_count_raw) if tp_count_raw and tp_count_raw.isdigit() else 0
-        tp_pnl_raw = self._db.get_heuristic("exit_take_profit_pnl")
+        # ── Trailing stop percentage learning ───────────────────────
+        trail_raw = self._db.get_heuristic("trail_pct")
+        if trail_raw:
+            try:
+                learned = float(trail_raw)
+                self._trail_pct = max(TRAIL_PCT_FLOOR, min(TRAIL_PCT_CEILING, learned))
+            except (ValueError, TypeError):
+                pass
 
-        # Also check time-decay TP exits
-        td_tp_count_raw = self._db.get_heuristic("exit_time_decay_tp_count")
-        td_tp_count = int(td_tp_count_raw) if td_tp_count_raw and td_tp_count_raw.isdigit() else 0
-
-        total_tp = tp_count + td_tp_count
-
-        if total_tp >= 3:
-            # Only adjust if we have enough COMPLETED analyses — not just exit counts.
-            # exit_tp_analysed_count is incremented by postmortem.analyze_exit_regret()
-            # once a market actually settles, so it can't be gamed by open markets.
-            tp_analysed_raw = self._db.get_heuristic("exit_tp_analysed_count")
-            tp_analysed = int(tp_analysed_raw) if tp_analysed_raw and tp_analysed_raw.isdigit() else 0
-
-            tp_regret_raw = self._db.get_heuristic("exit_tp_regret_count")
-            tp_regret = int(tp_regret_raw) if tp_regret_raw and tp_regret_raw.isdigit() else 0
-
-            if tp_analysed > 0:
-                regret_rate = tp_regret / tp_analysed
-            else:
-                regret_rate = None  # not enough data yet
-
-            if regret_rate is not None and regret_rate > 0.60:
-                # We're exiting too early too often — raise TP threshold
-                self._tp_threshold = min(0.80, DEFAULT_TP_THRESHOLD + 0.10)
-                if log_output:
-                    logger.info(
-                        "LEARNED: TP threshold raised to %.0f%% (regret_rate=%.0f%%, %d/%d analysed)",
-                        self._tp_threshold * 100, regret_rate * 100, tp_analysed, total_tp,
-                    )
-            elif regret_rate is not None and regret_rate < 0.25 and tp_analysed >= 3:
-                # Our exits are well-timed — can tighten slightly
-                self._tp_threshold = max(0.25, DEFAULT_TP_THRESHOLD - 0.05)
-                if log_output:
-                    logger.info(
-                        "LEARNED: TP threshold lowered to %.0f%% (regret_rate=%.0f%%, %d/%d analysed)",
-                        self._tp_threshold * 100, regret_rate * 100, tp_analysed, total_tp,
-                    )
-            elif regret_rate is None and log_output:
-                logger.info(
-                    "TP threshold: holding at default %.0f%% — waiting for %d exits to settle "
-                    "(%d/%d analysed so far)",
-                    self._tp_threshold * 100, 3, tp_analysed, total_tp,
-                )
-
-        # ── Stop-loss threshold learning ────────────────────────────
-        sl_count_raw = self._db.get_heuristic("exit_stop_loss_count")
-        sl_count = int(sl_count_raw) if sl_count_raw and sl_count_raw.isdigit() else 0
-
-        td_sl_count_raw = self._db.get_heuristic("exit_time_decay_stop_count")
-        td_sl_count = int(td_sl_count_raw) if td_sl_count_raw and td_sl_count_raw.isdigit() else 0
-
-        total_sl = sl_count + td_sl_count
-
-        if total_sl >= 3:
-            # Only adjust if we have enough COMPLETED analyses — not just exit counts.
-            # exit_sl_analysed_count is incremented by postmortem.analyze_exit_regret()
-            # once a market actually settles, so pending/unsettled exits don't count.
-            sl_analysed_raw = self._db.get_heuristic("exit_sl_analysed_count")
-            sl_analysed = int(sl_analysed_raw) if sl_analysed_raw and sl_analysed_raw.isdigit() else 0
-
-            sl_regret_raw = self._db.get_heuristic("exit_sl_regret_count")
-            sl_regret = int(sl_regret_raw) if sl_regret_raw and sl_regret_raw.isdigit() else 0
-
-            if sl_analysed > 0:
-                regret_rate = sl_regret / sl_analysed
-            else:
-                regret_rate = None  # not enough data yet
-
-            if regret_rate is not None and regret_rate > 0.50:
-                # Stopping out too early — give positions more room
-                self._sl_threshold = min(0.75, DEFAULT_SL_THRESHOLD + 0.10)
-                if log_output:
-                    logger.info(
-                        "LEARNED: SL threshold raised to %.0f%% (regret_rate=%.0f%%, %d/%d analysed)",
-                        self._sl_threshold * 100, regret_rate * 100, sl_analysed, total_sl,
-                    )
-            elif regret_rate is not None and regret_rate < 0.20 and sl_analysed >= 3:
-                # Our stops are saving us money — tighten them
-                self._sl_threshold = max(0.30, DEFAULT_SL_THRESHOLD - 0.05)
-                if log_output:
-                    logger.info(
-                        "LEARNED: SL threshold lowered to %.0f%% (regret_rate=%.0f%%, %d/%d analysed)",
-                        self._sl_threshold * 100, regret_rate * 100, sl_analysed, total_sl,
-                    )
-            elif regret_rate is None and log_output:
-                logger.info(
-                    "SL threshold: holding at default %.0f%% — waiting for exits to settle "
-                    "(%d/%d analysed so far)",
-                    self._sl_threshold * 100, sl_analysed, total_sl,
-                )
-
-        if log_output and (total_tp > 0 or total_sl > 0):
+        if log_output:
             logger.info(
-                "Exit thresholds: TP=%.0f%% (exits=%d) | SL=%.0f%% (exits=%d) | exit_aggr=%.2f",
-                self._tp_threshold * 100, total_tp,
-                self._sl_threshold * 100, total_sl,
+                "Exit thresholds: trail=%.1f%% | exit_aggr=%.2f",
+                self._trail_pct * 100,
                 self._exit_aggression,
             )

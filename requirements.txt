@@ -21,9 +21,13 @@ beautifulsoup4>=4.12.0
 requests>=2.31.0
 
 # ML / Statistics
-xgboost>=2.0.0
+lightgbm>=4.0.0
 scikit-learn>=1.4.0
 numpy>=1.26.0
+pandas>=2.0.0
+joblib>=1.3.0
 
 # Async
 aiohttp>=3.9.0
+
+# GUI (tkinter is stdlib, no extra dependency needed)

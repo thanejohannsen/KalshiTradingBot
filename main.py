@@ -39,10 +39,20 @@ from utils import (
     setup_logging,
 )
 
-logger: logging.Logger = None  # type: ignore[assignment]
+logger = logging.getLogger("kalshi_bot")
 
 # Graceful shutdown flag
 _shutdown = False
+
+
+def set_shutdown() -> None:
+    """Set shutdown flag from external callers (e.g., TUI)."""
+    global _shutdown
+    _shutdown = True
+
+
+def is_shutdown() -> bool:
+    return _shutdown
 
 
 def _handle_signal(signum: int, frame: Any) -> None:
@@ -57,9 +67,10 @@ def _handle_signal(signum: int, frame: Any) -> None:
 class TradingBot:
     """Orchestrates the full multi-agent trading pipeline."""
 
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, cfg: Config, state: Any = None) -> None:
         self.cfg = cfg
         self.db = Database(cfg.db_path)
+        self._state = state  # Optional BotState for TUI integration
 
         # ── API clients ─────────────────────────────────────────────
         self.kalshi = KalshiAPIClient(cfg, shutdown_check=lambda: _shutdown)
@@ -150,6 +161,8 @@ class TradingBot:
             try:
                 balance = self.kalshi.get_balance()
                 logger.info("Kalshi balance: $%.2f", balance)
+                if self._state:
+                    self._state.set_balance(balance)
             except Exception as exc:
                 logger.warning("Could not fetch balance: %s", exc)
 
@@ -159,13 +172,26 @@ class TradingBot:
         if imported:
             logger.info("Imported %d untracked position(s) from Kalshi API", imported)
 
+        # Re-sync entry prices for existing trades using fills API
+        # (fixes trades imported with wrong entry prices)
+        resynced = self.execution_agent.resync_entry_prices()
+        if resynced:
+            logger.info("Resynced entry prices for %d trade(s)", resynced)
+
         self._log_trade_history()
         self.strategy_evolution.log_status()
         self._start_position_monitor_thread()
 
+    def _set_phase(self, phase: str) -> None:
+        if self._state:
+            self._state.set_phase(phase)
+
     def run_cycle(self) -> None:
         """Execute one full pipeline cycle."""
         cycle_start = time.monotonic()
+        if self._state:
+            self._state.increment_cycle()
+        self._set_phase("monitoring")
         logger.info("─" * 50)
         logger.info("CYCLE START")
 
@@ -180,11 +206,17 @@ class TradingBot:
             )
 
         # ── STEP 1: SCAN ────────────────────────────────────────────
+        self._set_phase("scanning")
         candidates = self.scan_agent.scan()
         if not candidates:
             logger.info("No candidates found this cycle.")
         else:
+            # Store scan results for TUI
+            if self._state:
+                self._state.set_scan_results(candidates)
+
             # ── STEP 2: RESEARCH (parallel) ─────────────────────────────
+            self._set_phase("researching")
             set_position_monitor_console_deferred(True)
             try:
                 research_results = self.research_agent.research_batch(candidates)
@@ -198,6 +230,7 @@ class TradingBot:
             research_map = {r.ticker: r for r in research_results}
 
             # ── STEP 3: PREDICT ─────────────────────────────────────────
+            self._set_phase("predicting")
             predictions = []
             for cand in candidates:
                 research = research_map.get(cand.market.ticker)
@@ -213,6 +246,7 @@ class TradingBot:
                 logger.info("%d predictions with edge above threshold", len(predictions))
 
             # ── STEP 4: RISK + STEP 5: EXECUTE ─────────────────────────
+            self._set_phase("executing")
             # Get current bankroll (live) or use config (paper).
             # In live mode, Kalshi's get_balance() already returns spendable
             # cash net of any reserved funds — no further adjustment needed.
@@ -225,6 +259,7 @@ class TradingBot:
 
             blocked_count = 0
             approved_count = 0
+            risk_decisions: list[dict[str, Any]] = []
 
             for cand, research, pred in predictions:
                 # In live mode, re-fetch the real balance before each trade so
@@ -237,6 +272,15 @@ class TradingBot:
                         pass  # keep last known value
 
                 decision = self.risk_agent.evaluate(pred, research, cand, bankroll)
+                risk_decisions.append({
+                    "ticker": pred.ticker,
+                    "approved": decision.approved,
+                    "side": decision.side,
+                    "edge": pred.edge,
+                    "quality": pred.quality_score,
+                    "reasoning": decision.reasoning,
+                    "size": decision.size_dollars,
+                })
                 if decision.approved:
                     approved_count += 1
                     logger.info(
@@ -276,8 +320,11 @@ class TradingBot:
                 approved_count,
                 blocked_count,
             )
+            if self._state:
+                self._state.set_risk_decisions(risk_decisions, approved_count, blocked_count)
 
         # ── STEP 5 (continued): MONITOR SETTLEMENTS ─────────────────
+        self._set_phase("monitoring")
         with self._pm_lock:
             resolved = self.execution_agent.monitor_open_trades()
 
@@ -303,6 +350,7 @@ class TradingBot:
         # ── STEP 8: STRATEGY EVOLUTION (every 10 cycles) ────────────
         self.strategy_evolution.maybe_evolve()
 
+        self._set_phase("sleeping")
         elapsed = time.monotonic() - cycle_start
         logger.info("CYCLE COMPLETE in %.1fs", elapsed)
 

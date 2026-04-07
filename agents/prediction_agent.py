@@ -200,7 +200,7 @@ class PredictionAgent:
         scores["alignment"] = alignment_pts
 
         # ── Factor 5: Category Track Record (0-10 pts) ─────────────
-        cat = candidate.market.category or candidate.market.ticker[:4]
+        cat = candidate.market.category or candidate.market.ticker[:7]
         cat_stats = self._db.get_category_stats()
         cat_pts = 5.0
         if cat in cat_stats:
@@ -300,6 +300,16 @@ class PredictionAgent:
             "current_price":        candidate.market.last_price or market_prob,
             "volume_ratio":         volume_ratio,
             "sportsbook_prob":      research.sportsbook_prob,  # None for non-SPORTS
+            # Fields for CalibrationModel
+            "category":             category,
+            "spread":               candidate.market.spread,
+            "volume_24h":           candidate.market.volume_24h,
+            "open_interest":        candidate.market.open_interest,
+            "volume":               candidate.market.volume_24h,  # best proxy available
+            "yes_bid":              candidate.market.yes_bid,
+            "yes_ask":              candidate.market.yes_ask,
+            "no_bid":               candidate.market.no_bid,
+            "no_ask":               candidate.market.no_ask,
         }
 
         # Run ensemble

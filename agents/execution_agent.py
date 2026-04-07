@@ -18,10 +18,6 @@ from utils import TradeDecision
 
 logger = logging.getLogger("kalshi_bot.execution_agent")
 
-DEFAULT_TP_THRESHOLD = 0.40
-DEFAULT_SL_THRESHOLD = 0.50
-
-
 class ExecutionAgent:
     def __init__(self, cfg: Config, db: Database, kalshi: KalshiAPIClient) -> None:
         self._cfg = cfg
@@ -156,30 +152,20 @@ class ExecutionAgent:
             if self._db.has_open_position(ticker):
                 continue
 
-            # Find the most recent buy order for this ticker to get entry price
+            # Find entry price from fills API — actual execution prices
             side = "yes" if yes_count > 0 else "no"
             contracts = yes_count if side == "yes" else no_count
-            entry_price = 0.0
-            try:
-                orders = self._kalshi.list_orders(limit=200)
-                buy_orders = [
-                    o for o in orders
-                    if o.get("ticker") == ticker
-                    and o.get("side") == side
-                    and o.get("action") == "buy"
-                    and o.get("status") in ("executed", "filled")
-                ]
-                if buy_orders:
-                    entry_price = buy_orders[-1].get("price") or 0.0
-            except Exception:
-                pass
+            entry_price = self._compute_entry_price_from_fills(ticker, side)
 
-            # Fall back to current market price if no order found
-            if entry_price <= 0:
-                try:
-                    market = self._kalshi.get_market(ticker)
+            # Last resort: current market ask price
+            market_category = ""
+            try:
+                market = self._kalshi.get_market(ticker)
+                if entry_price <= 0:
                     entry_price = market.yes_ask if side == "yes" else (market.no_ask or 0.0)
-                except Exception:
+                market_category = market.category or ""
+            except Exception:
+                if entry_price <= 0:
                     entry_price = 0.01
 
             trade_record = {
@@ -191,6 +177,7 @@ class ExecutionAgent:
                 "size_contracts": contracts,
                 "order_type": "limit",
                 "thesis": "Imported from Kalshi API at startup",
+                "manual": 1,
                 "predicted_prob": None,
                 "market_prob": None,
                 "edge": None,
@@ -198,7 +185,7 @@ class ExecutionAgent:
                 "narrative": None,
                 "confidence": None,
                 "signals": None,
-                "category": "",
+                "category": market_category,
                 "status": "open",
                 "kalshi_order_id": None,
                 "entry_filled_at": datetime.now(timezone.utc).isoformat(),
@@ -211,6 +198,109 @@ class ExecutionAgent:
             imported += 1
 
         return imported
+
+    def _compute_entry_price_from_fills(self, ticker: str, side: str) -> float:
+        """Compute weighted average entry price from Kalshi fills API.
+
+        The fills endpoint returns actual execution records with the real
+        price paid, which is more reliable than order prices.
+        Falls back to order history if fills endpoint fails.
+        """
+        # Try fills API first (most accurate)
+        try:
+            fills = self._kalshi.get_fills(ticker=ticker)
+            buy_fills = [
+                f for f in fills
+                if f.get("action") == "buy" and f.get("side") == side
+            ]
+            if buy_fills:
+                total_cost = 0.0
+                total_count = 0
+                for f in buy_fills:
+                    px = f.get("price") or 0.0
+                    ct = f.get("count") or 0
+                    if px > 0 and ct > 0:
+                        total_cost += px * ct
+                        total_count += ct
+                if total_count > 0:
+                    avg = total_cost / total_count
+                    logger.debug(
+                        "Fills API: %s %s → %d fills, avg $%.4f (%d contracts)",
+                        ticker, side, len(buy_fills), avg, total_count,
+                    )
+                    return avg
+        except Exception as exc:
+            logger.debug("Fills API failed for %s: %s — trying orders", ticker, exc)
+
+        # Fallback: order history
+        try:
+            orders = self._kalshi.list_orders(limit=200)
+            buy_orders = [
+                o for o in orders
+                if o.get("ticker") == ticker
+                and o.get("side") == side
+                and o.get("action") == "buy"
+                and o.get("status") in ("executed", "filled")
+            ]
+            if buy_orders:
+                total_cost = 0.0
+                total_filled = 0
+                for bo in buy_orders:
+                    px = bo.get("price") or 0.0
+                    filled = bo.get("filled_count") or bo.get("initial_count") or 0
+                    if px > 0 and filled > 0:
+                        total_cost += px * filled
+                        total_filled += filled
+                if total_filled > 0:
+                    return total_cost / total_filled
+        except Exception:
+            pass
+
+        return 0.0
+
+    def resync_entry_prices(self) -> int:
+        """Re-sync entry prices for all open manual trades using Kalshi fills.
+
+        Fixes trades that were imported with wrong entry prices (e.g.,
+        market_value fallback was used instead of actual fill price).
+        Called at startup after import_untracked_positions().
+        """
+        if not self._cfg.is_live:
+            return 0
+
+        open_trades = self._db.get_open_trades()
+        updated = 0
+
+        for trade in open_trades:
+            ticker = trade["ticker"]
+            side = trade["side"]
+            old_price = float(trade.get("entry_price") or 0)
+            trade_id = trade["id"]
+
+            fills_price = self._compute_entry_price_from_fills(ticker, side)
+            if fills_price <= 0:
+                continue
+
+            # Only update if significantly different (>1% off)
+            if old_price > 0 and abs(fills_price - old_price) / old_price < 0.01:
+                continue
+
+            contracts = int(trade.get("size_contracts") or 0)
+            new_size_dollars = round(contracts * fills_price, 2)
+
+            with self._db._connect() as conn:
+                conn.execute(
+                    "UPDATE trades SET entry_price = ?, size_dollars = ? WHERE id = ?",
+                    (fills_price, new_size_dollars, trade_id),
+                )
+
+            logger.info(
+                "Resynced entry price: trade #%d %s %s | $%.4f → $%.4f",
+                trade_id, ticker, side, old_price, fills_price,
+            )
+            updated += 1
+
+        return updated
 
     def reconcile_with_kalshi(self) -> int:
         """
@@ -250,7 +340,12 @@ class ExecutionAgent:
             return 0
 
         cancelled = 0
+        tp_resolved = 0
         for trade in open_trades:
+            # Skip manually placed trades — don't reconcile or cancel them
+            if trade.get("manual"):
+                continue
+
             ticker = trade["ticker"]
             order_id = trade.get("kalshi_order_id") or ""
             trade_id = trade["id"]
@@ -259,6 +354,35 @@ class ExecutionAgent:
             in_orders    = order_id in active_order_ids
 
             if not in_positions and not in_orders:
+                # Before cancelling, check if a TP order filled — that means
+                # the position was closed profitably, not cancelled.
+                tp_order_id = trade.get("tp_order_id")
+                if tp_order_id and trade.get("entry_filled_at"):
+                    try:
+                        tp_status = self._kalshi.get_order_status(tp_order_id)
+                        if self._is_filled_order_status(tp_status):
+                            exit_price = float(
+                                (tp_status or {}).get("price")
+                                or trade.get("tp_price")
+                                or trade["entry_price"]
+                            )
+                            entry_price = float(trade["entry_price"])
+                            contracts = int(trade.get("size_contracts") or 0)
+                            pnl = round((exit_price - entry_price) * contracts, 2)
+                            status = "exited_profit" if pnl > 0 else "exited_loss"
+
+                            self._db.clear_trade_bracket_orders(trade_id)
+                            self._db.resolve_trade(trade_id, status, pnl)
+
+                            logger.info(
+                                "Reconcile: trade #%d %s TP filled — %s | entry=$%.2f exit=$%.2f pnl=$%.2f",
+                                trade_id, ticker, status, entry_price, exit_price, pnl,
+                            )
+                            tp_resolved += 1
+                            continue
+                    except Exception as exc:
+                        logger.debug("Reconcile: could not check TP for #%d: %s", trade_id, exc)
+
                 self._db.cancel_trade(trade_id)
                 logger.info(
                     "Reconcile: trade #%d %s not in Kalshi positions or orders — cancelled",
@@ -268,6 +392,37 @@ class ExecutionAgent:
 
         if cancelled:
             logger.info("Reconciliation cancelled %d ghost trade(s)", cancelled)
+        if tp_resolved:
+            logger.info("Reconciliation resolved %d TP-filled trade(s)", tp_resolved)
+
+        # Cancel stale resting sell orders left over from the old TP system.
+        # Trailing stop now handles all exits — no resting sells should exist.
+        stale_cancelled = 0
+        for order in active_orders:
+            if str(order.get("action", "")).lower() != "sell":
+                continue
+            oid = order.get("order_id", "")
+            # Check if any open trade in DB still references this as a TP order
+            is_tracked = any(
+                t.get("tp_order_id") == oid
+                for t in open_trades
+            )
+            if not is_tracked:
+                try:
+                    self._kalshi.cancel_order(oid)
+                    stale_cancelled += 1
+                    logger.info(
+                        "Reconcile: cancelled stale resting sell order %s (%s %s x%s)",
+                        oid,
+                        order.get("side", "?"),
+                        order.get("ticker", "?"),
+                        order.get("remaining_count", "?"),
+                    )
+                except Exception as exc:
+                    logger.debug("Could not cancel stale order %s: %s", oid, exc)
+        if stale_cancelled:
+            logger.info("Reconciliation cancelled %d stale resting sell order(s)", stale_cancelled)
+
         return cancelled
 
     def monitor_open_trades(self) -> list[dict[str, Any]]:
@@ -286,6 +441,10 @@ class ExecutionAgent:
         resolved: list[dict[str, Any]] = []
 
         for trade in open_trades:
+            # Skip manually placed trades — don't touch them
+            if trade.get("manual"):
+                continue
+
             ticker = trade["ticker"]
             order_id = trade.get("kalshi_order_id")
 
@@ -337,17 +496,27 @@ class ExecutionAgent:
         trade: dict[str, Any],
         status_info: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
-        """Detect entry fills, place live stop protection, and resolve stop exits."""
+        """Detect entry fills, place resting TP order, and reconcile TP fills.
+
+        Stop-loss is handled entirely by the position monitor (active polling).
+        Kalshi has no stop/conditional order type — a limit sell below the bid
+        fills immediately, so resting SL orders are impossible.
+        """
         if not self._cfg.is_live or trade.get("action") != "buy":
             return None
 
         entry_status = str((status_info or {}).get("status", "")).lower()
-        if not trade.get("entry_filled_at") and entry_status in ("executed", "filled"):
+        filled_count = int((status_info or {}).get("filled_count", 0) or 0)
+
+        # Mark entry filled on full fill OR partial fill (any contracts held)
+        if not trade.get("entry_filled_at") and (
+            entry_status in ("executed", "filled") or filled_count > 0
+        ):
             self._db.mark_trade_entry_filled(trade["id"])
             trade["entry_filled_at"] = datetime.utcnow().isoformat()
             self._ensure_exit_brackets(trade)
 
-        if trade.get("entry_filled_at") and not (trade.get("tp_order_id") or trade.get("sl_order_id")):
+        if trade.get("entry_filled_at") and not trade.get("tp_order_id"):
             self._ensure_exit_brackets(trade)
 
         if trade.get("tp_order_id") or trade.get("sl_order_id"):
@@ -403,50 +572,121 @@ class ExecutionAgent:
     # Fill tracking & execution learning
     # ------------------------------------------------------------------
     def _check_fill_status(self, trade: dict, order_id: str) -> dict[str, Any] | None:
-        """Check if a live order has filled and record fill data for learning."""
-        if order_id in self._counted_orders:
-            return None  # already counted this order
+        """
+        Check order fill status from Kalshi (source of truth) and sync DB.
+
+        Handles three states:
+          1. Fully filled   → mark entry filled, record fill stat
+          2. Partial fill   → update DB contracts to filled count, mark entry
+                              filled so position monitor tracks the held portion
+          3. Cancelled/gone → cancel in DB, or cancel only unfilled portion
+                              if some contracts already filled
+        """
         try:
             status = self._kalshi.get_order_status(order_id)
-            order_status = status.get("status", "")
-            remaining = status.get("remaining_count", 0)
-
-            if order_status in ("executed", "filled"):
-                self._counted_orders.add(order_id)
-                self._record_fill(trade, filled=True, partial=False)
-            elif order_status in ("canceled", "cancelled", "expired"):
-                self._counted_orders.add(order_id)
-                self._record_fill(trade, filled=False, partial=False)
-                logger.info(
-                    "Order %s for %s did NOT fill (status=%s) — marking cancelled",
-                    order_id, trade["ticker"], order_status,
-                )
-                self._db.cancel_trade(trade["id"])
-            elif remaining > 0 and remaining < trade.get("size_contracts", 0):
-                self._counted_orders.add(order_id)
-                self._record_fill(trade, filled=True, partial=True)
-            return status
         except Exception as exc:
-            # 404 = order no longer exists on Kalshi (expired, cancelled server-side,
-            # or cleaned up). Treat as cancelled so it stops polluting open trades.
             exc_str = str(exc)
             if "404" in exc_str or "not_found" in exc_str:
-                self._counted_orders.add(order_id)
-                self._db.cancel_trade(trade["id"])
-                logger.info(
-                    "Order %s for %s not found on Kalshi (404) — marking cancelled",
-                    order_id, trade["ticker"],
-                )
+                # Order gone from Kalshi.  If we hold contracts for this ticker
+                # (checked via reconcile), the trade stays open with whatever
+                # the position monitor found.  Otherwise reconcile will cancel.
+                if order_id not in self._counted_orders:
+                    self._counted_orders.add(order_id)
+                    logger.info(
+                        "Order %s for %s not found on Kalshi (404)",
+                        order_id, trade["ticker"],
+                    )
             else:
                 logger.debug("Could not check fill status for %s: %s", order_id, exc)
             return None
+
+        order_status = str(status.get("status", "")).lower()
+        filled_count = int(status.get("filled_count", 0) or 0)
+        remaining = int(status.get("remaining_count", 0) or 0)
+        original_contracts = int(trade.get("size_contracts", 0) or 0)
+        entry_price = float(trade.get("entry_price") or 0)
+        trade_id = trade["id"]
+
+        # Skip if we already fully processed this order
+        if order_id in self._counted_orders:
+            return status
+
+        # ── Fully filled ───────────────────────────────────────────
+        if order_status in ("executed", "filled"):
+            self._counted_orders.add(order_id)
+            # Sync DB to actual fill count (may differ from original)
+            if filled_count > 0 and filled_count != original_contracts:
+                self._db.update_trade_fill(
+                    trade_id, filled_count,
+                    round(filled_count * entry_price, 2),
+                )
+                logger.info(
+                    "Fill sync: trade #%d %s | ordered=%d filled=%d → DB updated",
+                    trade_id, trade["ticker"], original_contracts, filled_count,
+                )
+            self._record_fill(trade, filled=True, partial=False)
+            return status
+
+        # ── Cancelled / expired ────────────────────────────────────
+        if order_status in ("canceled", "cancelled", "expired"):
+            self._counted_orders.add(order_id)
+
+            if filled_count > 0:
+                # Partial fill: some contracts filled before cancellation.
+                # Keep the trade open with the filled portion.
+                self._db.update_trade_fill(
+                    trade_id, filled_count,
+                    round(filled_count * entry_price, 2),
+                )
+                self._record_fill(trade, filled=True, partial=True)
+                logger.info(
+                    "Partial fill on cancelled order: trade #%d %s | "
+                    "filled=%d of %d — DB updated, trade stays open",
+                    trade_id, trade["ticker"], filled_count, original_contracts,
+                )
+                # Update in-memory trade dict so downstream code sees the truth
+                trade["size_contracts"] = filled_count
+                trade["size_dollars"] = round(filled_count * entry_price, 2)
+            else:
+                # Nothing filled — fully cancel
+                self._record_fill(trade, filled=False, partial=False)
+                self._db.cancel_trade(trade_id)
+                logger.info(
+                    "Order %s for %s fully cancelled (0 filled) — trade #%d cancelled",
+                    order_id, trade["ticker"], trade_id,
+                )
+            return status
+
+        # ── Still resting — check for partial fill in progress ─────
+        if filled_count > 0 and remaining > 0:
+            # Some filled, some still resting.  Update DB to reflect
+            # the filled portion so position monitor can track it.
+            if filled_count != original_contracts:
+                self._db.update_trade_fill(
+                    trade_id, filled_count,
+                    round(filled_count * entry_price, 2),
+                )
+                trade["size_contracts"] = filled_count
+                trade["size_dollars"] = round(filled_count * entry_price, 2)
+                logger.info(
+                    "Partial fill in progress: trade #%d %s | "
+                    "filled=%d remaining=%d — DB synced to filled",
+                    trade_id, trade["ticker"], filled_count, remaining,
+                )
+            self._record_fill(trade, filled=True, partial=True)
+
+        return status
 
     def _maybe_reprice_stale_buy_order(
         self,
         trade: dict[str, Any],
         status: dict[str, Any] | None,
     ) -> None:
-        """Cancel/replace stale buy orders so they don't rest indefinitely."""
+        """Cancel/replace stale buy orders so they don't rest indefinitely.
+
+        Only reprices the unfilled remainder — already-filled contracts are
+        tracked in the DB by _check_fill_status and won't be re-ordered.
+        """
         if not status:
             return
         if trade.get("action") != "buy":
@@ -457,7 +697,7 @@ class ExecutionAgent:
             return
 
         order_status = str(status.get("status", "")).lower()
-        if order_status in ("executed", "filled", "canceled", "expired"):
+        if order_status in ("executed", "filled", "canceled", "cancelled", "expired"):
             return
 
         opened_at = trade.get("opened_at")
@@ -473,11 +713,8 @@ class ExecutionAgent:
         if age_seconds < self._cfg.buy_order_adjust_seconds:
             return
 
-        remaining = status.get("remaining_count", trade.get("size_contracts", 0))
-        try:
-            remaining_count = int(remaining)
-        except Exception:
-            remaining_count = int(trade.get("size_contracts", 0) or 0)
+        # Only reprice the unfilled remainder from Kalshi (source of truth)
+        remaining_count = int(status.get("remaining_count", 0) or 0)
         if remaining_count <= 0:
             return
 
@@ -515,7 +752,8 @@ class ExecutionAgent:
             if new_order_id:
                 self._db.update_trade_order(trade["id"], new_order_id, new_price)
                 logger.info(
-                    "Repriced stale BUY order %s: %s %.2f -> %.2f (age=%.0fs, remaining=%d)",
+                    "Repriced stale BUY: trade #%d %s %.2f -> %.2f "
+                    "(age=%.0fs, remaining=%d of original)",
                     trade["id"],
                     trade["ticker"],
                     old_price,
@@ -575,98 +813,72 @@ class ExecutionAgent:
                 )
 
     def _ensure_exit_brackets(self, trade: dict[str, Any]) -> None:
-        """Place a resting stop-loss order after entry fill."""
-        if trade.get("tp_order_id") or trade.get("sl_order_id"):
-            return
+        """No-op — trailing stop replaced fixed TP resting orders.
 
-        contracts = int(trade.get("size_contracts", 0) or 0)
-        if contracts <= 0:
-            return
-
-        entry_price = float(trade.get("entry_price") or 0.0)
-        tp_threshold, sl_threshold = self._get_exit_thresholds()
-        tp_price = round(min(0.99, max(0.01, entry_price + tp_threshold * (1.0 - entry_price))), 2)
-        sl_price = round(min(0.99, max(0.01, entry_price - sl_threshold * entry_price)), 2)
-
-        sl_order_id: str | None = None
-        try:
-            sl_order = self._kalshi.place_order(
-                ticker=trade["ticker"],
-                side=trade["side"],
-                action="sell",
-                count=contracts,
-                price=sl_price,
-                order_type="limit",
-            )
-            sl_order_id = sl_order.get("order_id")
-        except Exception as exc:
-            if sl_order_id:
-                self._kalshi.cancel_order(sl_order_id)
-            logger.warning("Failed to place live stop-loss for %s: %s", trade.get("ticker"), exc)
-            return
-
-        if not sl_order_id:
-            return
-
-        self._db.set_trade_bracket_orders(
-            trade_id=trade["id"],
-            tp_order_id=None,
-            tp_price=tp_price,
-            sl_order_id=sl_order_id,
-            sl_price=sl_price,
-        )
-        trade["tp_price"] = tp_price
-        trade["sl_order_id"] = sl_order_id
-        trade["sl_price"] = sl_price
-
-        logger.info(
-            "[LIVE] Stop-loss armed for %s: SL order=%s @ %.2f | TP trigger=%.2f",
-            trade["ticker"],
-            sl_order_id,
-            sl_price,
-            tp_price,
-        )
+        Exit management is now handled entirely by the position monitor's
+        trailing stop logic (high-water mark tracking + trail percentage).
+        This method is kept so _sync_entry_and_brackets doesn't break, but
+        it no longer places any orders.
+        """
+        return
 
     def _reconcile_exit_brackets(self, trade: dict[str, Any]) -> dict[str, Any] | None:
-        """Resolve trade when a live stop order fills, or re-arm if it disappears."""
+        """Check if the resting TP order has filled; resolve the trade if so.
+
+        If the TP order was cancelled or disappeared, re-arm it.
+        Legacy SL order IDs are also handled for backwards compatibility.
+        """
         tp_order_id = trade.get("tp_order_id")
-        sl_order_id = trade.get("sl_order_id")
+        sl_order_id = trade.get("sl_order_id")  # legacy — may exist on older trades
 
-        tp_status = None
-        sl_status = None
-        import requests
-        try:
-            tp_status = self._kalshi.get_order_status(tp_order_id) if tp_order_id else None
-        except requests.HTTPError as exc:
-            logger.warning(f"Failed to get TP order status for {tp_order_id}: {exc}")
-        try:
-            sl_status = self._kalshi.get_order_status(sl_order_id) if sl_order_id else None
-        except requests.HTTPError as exc:
-            logger.warning(f"Failed to get SL order status for {sl_order_id}: {exc}")
+        # Cancel any legacy SL orders that predate this fix
+        if sl_order_id:
+            import requests
+            try:
+                self._kalshi.cancel_order(sl_order_id)
+                logger.info("[LIVE] Cancelled legacy SL order %s for %s", sl_order_id, trade["ticker"])
+            except requests.HTTPError:
+                pass
+            self._db.set_trade_bracket_orders(
+                trade_id=trade["id"],
+                tp_order_id=tp_order_id,
+                tp_price=trade.get("tp_price"),
+                sl_order_id=None,
+                sl_price=None,
+            )
+            trade["sl_order_id"] = None
+            trade["sl_price"] = None
 
-        tp_done = self._is_filled_order_status(tp_status)
-        sl_done = self._is_filled_order_status(sl_status)
-        if not tp_done and not sl_done:
-            tp_terminal = self._is_terminal_order_status(tp_status) if tp_status else True
-            sl_terminal = self._is_terminal_order_status(sl_status) if sl_status else False
-            if tp_terminal and sl_terminal:
-                self._db.clear_trade_bracket_orders(trade["id"])
-                trade["tp_order_id"] = None
-                trade["sl_order_id"] = None
-                self._ensure_exit_brackets(trade)
+        if not tp_order_id:
             return None
 
-        exit_status = tp_status if tp_done else sl_status
-        sibling_order_id = sl_order_id if tp_done else tp_order_id
-        exit_price = float((exit_status or {}).get("price") or trade.get("tp_price") or trade.get("sl_price") or trade["entry_price"])
+        import requests
+        tp_status = None
+        try:
+            tp_status = self._kalshi.get_order_status(tp_order_id)
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 0
+            if status_code == 404:
+                logger.info("TP order %s no longer exists (404) — clearing (trailing stop handles exits)", tp_order_id)
+                self._db.clear_trade_bracket_orders(trade["id"])
+                trade["tp_order_id"] = None
+                # Legacy TP gone — trailing stop handles exits now
+            else:
+                logger.warning("Failed to get TP order status for %s: %s", tp_order_id, exc)
+            return None
+
+        tp_done = self._is_filled_order_status(tp_status)
+        if not tp_done:
+            # If TP order was cancelled/expired, just clear it (trailing stop handles exits now)
+            if self._is_terminal_order_status(tp_status):
+                self._db.clear_trade_bracket_orders(trade["id"])
+                trade["tp_order_id"] = None
+            return None
+
+        # TP filled — resolve the trade
+        exit_price = float((tp_status or {}).get("price") or trade.get("tp_price") or trade["entry_price"])
         pnl = round((exit_price - float(trade["entry_price"])) * int(trade.get("size_contracts", 0) or 0), 2)
         trade_status = "exited_profit" if pnl > 0 else "exited_loss"
-
-        if sibling_order_id:
-            try:
-                self._kalshi.cancel_order(sibling_order_id)
-            except requests.HTTPError as exc:
-                logger.warning(f"Failed to cancel sibling order {sibling_order_id}: {exc}")
 
         self._db.clear_trade_bracket_orders(trade["id"])
         self._db.resolve_trade(trade["id"], trade_status, pnl)
@@ -676,48 +888,13 @@ class ExecutionAgent:
         resolved_trade["pnl"] = pnl
 
         logger.info(
-            "[LIVE] Stop-loss exit filled: %s | entry=$%.2f -> exit=$%.2f | pnl=$%.2f",
+            "[LIVE] Take-profit filled: %s | entry=$%.2f → exit=$%.2f | pnl=$%.2f",
             trade["ticker"],
             float(trade["entry_price"]),
             exit_price,
             pnl,
         )
         return resolved_trade
-
-    def _get_exit_thresholds(self) -> tuple[float, float]:
-        """Mirror the learned TP/SL thresholds used by the position monitor."""
-        tp_threshold = DEFAULT_TP_THRESHOLD
-        sl_threshold = DEFAULT_SL_THRESHOLD
-
-        tp_count_raw = self._db.get_heuristic("exit_take_profit_count")
-        td_tp_count_raw = self._db.get_heuristic("exit_time_decay_tp_count")
-        tp_count = int(tp_count_raw) if tp_count_raw and tp_count_raw.isdigit() else 0
-        td_tp_count = int(td_tp_count_raw) if td_tp_count_raw and td_tp_count_raw.isdigit() else 0
-        total_tp = tp_count + td_tp_count
-        if total_tp >= 3:
-            tp_regret_raw = self._db.get_heuristic("exit_tp_regret_count")
-            tp_regret = int(tp_regret_raw) if tp_regret_raw and tp_regret_raw.isdigit() else 0
-            regret_rate = tp_regret / total_tp if total_tp > 0 else 0.0
-            if regret_rate > 0.60:
-                tp_threshold = min(0.80, DEFAULT_TP_THRESHOLD + 0.10)
-            elif regret_rate < 0.25 and total_tp >= 5:
-                tp_threshold = max(0.25, DEFAULT_TP_THRESHOLD - 0.05)
-
-        sl_count_raw = self._db.get_heuristic("exit_stop_loss_count")
-        td_sl_count_raw = self._db.get_heuristic("exit_time_decay_stop_count")
-        sl_count = int(sl_count_raw) if sl_count_raw and sl_count_raw.isdigit() else 0
-        td_sl_count = int(td_sl_count_raw) if td_sl_count_raw and td_sl_count_raw.isdigit() else 0
-        total_sl = sl_count + td_sl_count
-        if total_sl >= 3:
-            sl_regret_raw = self._db.get_heuristic("exit_sl_regret_count")
-            sl_regret = int(sl_regret_raw) if sl_regret_raw and sl_regret_raw.isdigit() else 0
-            regret_rate = sl_regret / total_sl if total_sl > 0 else 0.0
-            if regret_rate > 0.50:
-                sl_threshold = min(0.75, DEFAULT_SL_THRESHOLD + 0.10)
-            elif regret_rate < 0.20 and total_sl >= 5:
-                sl_threshold = max(0.30, DEFAULT_SL_THRESHOLD - 0.05)
-
-        return tp_threshold, sl_threshold
 
     def _save_model_votes(self, trade_id: int, decision: TradeDecision) -> None:
         """Persist ensemble sub-model votes so postmortem can score them later."""

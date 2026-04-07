@@ -84,7 +84,7 @@ class RiskAgent:
                 return self._reject(ticker, reasons, prediction, research)
 
         # Apply fractional Kelly — use per-category base, then apply learned adjustment
-        category = candidate.market.category or candidate.market.ticker[:4]
+        category = candidate.market.category or candidate.market.ticker[:7]
         kelly_fraction = self._get_learned_kelly_fraction(category)
         # Scale Kelly by quality score: quality 50 = 1.0x, quality 100 = 1.5x, quality 30 = 0.6x
         quality_multiplier = max(0.5, min(1.5, quality_score / 50.0))
@@ -183,6 +183,11 @@ class RiskAgent:
             reasons.append("Already have open position in this market")
             return self._reject(ticker, reasons, prediction, research)
 
+        # ── Cooldown: don't re-enter a market we just exited ──────────
+        if self._db.was_recently_traded(ticker, hours=6.0):
+            reasons.append("Recently traded — 6h cooldown to prevent churning")
+            return self._reject(ticker, reasons, prediction, research)
+
         # ── Confidence gate (relaxed: quality score is primary filter) ─
         # Low confidence + low quality = reject
         if confidence == "low" and quality_score < 50:
@@ -238,7 +243,7 @@ class RiskAgent:
             prediction=prediction,
             research=research,
             signals=candidate.signals,
-            category=candidate.market.category or candidate.market.ticker[:4],
+            category=candidate.market.category or candidate.market.ticker[:7],
             spread_at_entry=round(spread_at_entry, 4),
         )
 

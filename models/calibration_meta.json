@@ -1,0 +1,214 @@
+{
+  "feature_cols": [
+    "trade_price",
+    "yes_bid",
+    "yes_ask",
+    "no_bid",
+    "no_ask",
+    "spread",
+    "price_squared",
+    "price_deviation_from_50",
+    "is_longshot",
+    "is_favorite",
+    "is_mid_range",
+    "log_volume",
+    "log_volume_24h",
+    "log_open_interest",
+    "trade_size",
+    "log_trade_size",
+    "taker_is_yes",
+    "category_code",
+    "hours_to_close",
+    "log_hours_to_close"
+  ],
+  "category_mapping": {
+    "CRYPTO": 0,
+    "DEFAULT": 1,
+    "ECONOMICS": 2,
+    "ENTERTAINMENT": 3,
+    "FINANCIALS": 4,
+    "POLITICS": 5,
+    "SPORTS": 6,
+    "WEATHER": 7
+  },
+  "metrics": {
+    "test_logloss": 0.201764,
+    "test_brier": 0.062484,
+    "baseline_logloss": 0.498474,
+    "baseline_brier": 0.166926,
+    "n_train": 5421116,
+    "n_test": 1355280
+  },
+  "feature_importance": {
+    "trade_price": 12592793.943496346,
+    "log_volume": 7266283.789722681,
+    "log_open_interest": 7126959.166966796,
+    "yes_bid": 4452668.681309223,
+    "price_squared": 4197033.939482212,
+    "yes_ask": 4111614.6025116444,
+    "hours_to_close": 1301172.4114778042,
+    "no_ask": 545353.0926413536,
+    "no_bid": 398366.43001770973,
+    "log_hours_to_close": 329624.487452507,
+    "log_volume_24h": 314057.7927556038,
+    "price_deviation_from_50": 247162.1707048416,
+    "is_longshot": 188040.17552661896,
+    "spread": 98446.90770554543,
+    "taker_is_yes": 23710.117228746414,
+    "category_code": 22035.537692308426,
+    "is_favorite": 13048.485037088394,
+    "trade_size": 12992.316520690918,
+    "is_mid_range": 3319.971610069275,
+    "log_trade_size": 2726.09050488472
+  },
+  "calibration_by_price": {
+    "1%-10%": {
+      "actual_rate": 0.037,
+      "market_avg": 0.046,
+      "model_avg": 0.0372,
+      "market_error": 0.0089,
+      "model_error": 0.0002,
+      "edge": -0.0088,
+      "count": 170598
+    },
+    "10%-20%": {
+      "actual_rate": 0.1308,
+      "market_avg": 0.1441,
+      "model_avg": 0.1311,
+      "market_error": 0.0134,
+      "model_error": 0.0003,
+      "edge": -0.0131,
+      "count": 148525
+    },
+    "20%-30%": {
+      "actual_rate": 0.2366,
+      "market_avg": 0.2445,
+      "model_avg": 0.2356,
+      "market_error": 0.008,
+      "model_error": 0.0009,
+      "edge": -0.0089,
+      "count": 147052
+    },
+    "30%-40%": {
+      "actual_rate": 0.3454,
+      "market_avg": 0.3453,
+      "model_avg": 0.3455,
+      "market_error": 0.0001,
+      "model_error": 0.0001,
+      "edge": 0.0002,
+      "count": 151868
+    },
+    "40%-50%": {
+      "actual_rate": 0.4264,
+      "market_avg": 0.446,
+      "model_avg": 0.4262,
+      "market_error": 0.0196,
+      "model_error": 0.0002,
+      "edge": -0.0198,
+      "count": 160096
+    },
+    "50%-60%": {
+      "actual_rate": 0.5441,
+      "market_avg": 0.5436,
+      "model_avg": 0.5462,
+      "market_error": 0.0004,
+      "model_error": 0.0022,
+      "edge": 0.0026,
+      "count": 154083
+    },
+    "60%-70%": {
+      "actual_rate": 0.63,
+      "market_avg": 0.6431,
+      "model_avg": 0.6286,
+      "market_error": 0.0131,
+      "model_error": 0.0014,
+      "edge": -0.0145,
+      "count": 129892
+    },
+    "70%-80%": {
+      "actual_rate": 0.7429,
+      "market_avg": 0.7436,
+      "model_avg": 0.7446,
+      "market_error": 0.0007,
+      "model_error": 0.0017,
+      "edge": 0.001,
+      "count": 103453
+    },
+    "80%-90%": {
+      "actual_rate": 0.8476,
+      "market_avg": 0.8436,
+      "model_avg": 0.8464,
+      "market_error": 0.004,
+      "model_error": 0.0011,
+      "edge": 0.0029,
+      "count": 88380
+    },
+    "90%-100%": {
+      "actual_rate": 0.9541,
+      "market_avg": 0.95,
+      "model_avg": 0.9542,
+      "market_error": 0.004,
+      "model_error": 0.0001,
+      "edge": 0.0041,
+      "count": 101333
+    }
+  },
+  "calibration_by_category": {
+    "CRYPTO": {
+      "actual_rate": 0.4287,
+      "avg_market_price": 0.4492,
+      "avg_model_pred": 0.4352,
+      "systematic_edge": -0.014,
+      "count": 1619
+    },
+    "DEFAULT": {
+      "actual_rate": 0.4421,
+      "avg_market_price": 0.4491,
+      "avg_model_pred": 0.4423,
+      "systematic_edge": -0.0069,
+      "count": 1276676
+    },
+    "ECONOMICS": {
+      "actual_rate": 0.5893,
+      "avg_market_price": 0.5526,
+      "avg_model_pred": 0.5869,
+      "systematic_edge": 0.0343,
+      "count": 4585
+    },
+    "ENTERTAINMENT": {
+      "actual_rate": 0.3601,
+      "avg_market_price": 0.3976,
+      "avg_model_pred": 0.3621,
+      "systematic_edge": -0.0355,
+      "count": 736
+    },
+    "FINANCIALS": {
+      "actual_rate": 0.3419,
+      "avg_market_price": 0.3413,
+      "avg_model_pred": 0.3417,
+      "systematic_edge": 0.0003,
+      "count": 39444
+    },
+    "POLITICS": {
+      "actual_rate": 0.4933,
+      "avg_market_price": 0.4844,
+      "avg_model_pred": 0.4933,
+      "systematic_edge": 0.0088,
+      "count": 22168
+    },
+    "SPORTS": {
+      "actual_rate": 0.2636,
+      "avg_market_price": 0.2712,
+      "avg_model_pred": 0.2633,
+      "systematic_edge": -0.0079,
+      "count": 8853
+    },
+    "WEATHER": {
+      "actual_rate": 0.407,
+      "avg_market_price": 0.4587,
+      "avg_model_pred": 0.4081,
+      "systematic_edge": -0.0507,
+      "count": 1199
+    }
+  }
+}

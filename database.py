@@ -42,10 +42,11 @@ class Database:
 
     def _get_conn(self) -> sqlite3.Connection:
         if not hasattr(self._local, "conn") or self._local.conn is None:
-            self._local.conn = sqlite3.connect(self._db_path)
+            self._local.conn = sqlite3.connect(self._db_path, timeout=30)
             self._local.conn.row_factory = sqlite3.Row
             self._local.conn.execute("PRAGMA journal_mode=WAL")
             self._local.conn.execute("PRAGMA foreign_keys=ON")
+            self._local.conn.execute("PRAGMA busy_timeout=30000")
         return self._local.conn
 
     # ------------------------------------------------------------------
@@ -187,6 +188,10 @@ class Database:
             conn.execute("ALTER TABLE trades ADD COLUMN sl_price REAL")
         if "spread_at_entry" not in cols:
             conn.execute("ALTER TABLE trades ADD COLUMN spread_at_entry REAL DEFAULT 0.0")
+        if "manual" not in cols:
+            conn.execute("ALTER TABLE trades ADD COLUMN manual INTEGER NOT NULL DEFAULT 0")
+        if "high_water_mark" not in cols:
+            conn.execute("ALTER TABLE trades ADD COLUMN high_water_mark REAL")
 
         # model_predictions table (added for ensemble B+C+E system)
         tables = {row[0] for row in conn.execute(
@@ -296,8 +301,9 @@ class Database:
                     (ticker, side, action, entry_price, size_dollars,
                      size_contracts, order_type, thesis, predicted_prob,
                      market_prob, edge, sentiment_score, narrative,
-                     confidence, signals, category, status, kalshi_order_id, opened_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     confidence, signals, category, status, kalshi_order_id,
+                     spread_at_entry, manual, opened_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     trade["ticker"],
@@ -318,6 +324,8 @@ class Database:
                     trade.get("category", ""),
                     trade.get("status", "open"),
                     trade.get("kalshi_order_id"),
+                    trade.get("spread_at_entry", 0.0),
+                    trade.get("manual", 0),
                     _now_iso(),
                 ),
             )
@@ -410,6 +418,25 @@ class Database:
                 (_now_iso(), trade_id),
             )
 
+    def update_trade_fill(
+        self,
+        trade_id: int,
+        filled_contracts: int,
+        size_dollars: float,
+    ) -> None:
+        """Update a trade's contract count and dollar size after a partial fill."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE trades
+                SET size_contracts = ?,
+                    size_dollars = ?,
+                    entry_filled_at = COALESCE(entry_filled_at, ?)
+                WHERE id = ?
+                """,
+                (filled_contracts, round(size_dollars, 2), _now_iso(), trade_id),
+            )
+
     def set_trade_bracket_orders(
         self,
         trade_id: int,
@@ -445,11 +472,49 @@ class Database:
                 (trade_id,),
             )
 
+    def toggle_trade_manual(self, trade_id: int) -> bool:
+        """Toggle the manual flag on a trade. Returns the new value."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE trades SET manual = CASE WHEN manual = 1 THEN 0 ELSE 1 END WHERE id = ?",
+                (trade_id,),
+            )
+            row = conn.execute("SELECT manual FROM trades WHERE id = ?", (trade_id,)).fetchone()
+            return bool(row["manual"]) if row else False
+
+    def update_high_water_mark(self, trade_id: int, price: float) -> None:
+        """Update the high-water mark for trailing stop tracking."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE trades
+                SET high_water_mark = MAX(COALESCE(high_water_mark, 0), ?)
+                WHERE id = ?
+                """,
+                (price, trade_id),
+            )
+
     def has_open_position(self, ticker: str) -> bool:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT COUNT(*) AS cnt FROM trades WHERE ticker = ? AND status = 'open'",
                 (ticker,),
+            ).fetchone()
+            return row["cnt"] > 0  # type: ignore[index]
+
+    def was_recently_traded(self, ticker: str, hours: float = 6.0) -> bool:
+        """True if this ticker had a trade opened or closed in the last N hours.
+
+        Prevents churning: the bot kept buying the same market right after
+        being stopped out, losing money on repeated round-trips.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) AS cnt FROM trades
+                   WHERE ticker = ?
+                     AND (opened_at > datetime('now', ? || ' hours')
+                          OR resolved_at > datetime('now', ? || ' hours'))""",
+                (ticker, str(-hours), str(-hours)),
             ).fetchone()
             return row["cnt"] > 0  # type: ignore[index]
 
@@ -667,6 +732,31 @@ class Database:
             return d
 
     # ------------------------------------------------------------------
+    def get_recent_trades(self, limit: int = 30) -> list[dict[str, Any]]:
+        """Return the most recent trades (any status) for UI display."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM trades ORDER BY opened_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_recent_postmortems_with_trades(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Join postmortems with their trade for display context."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT p.*, t.ticker, t.side, t.entry_price,
+                       t.pnl AS trade_pnl, t.status AS trade_status
+                FROM postmortems p
+                JOIN trades t ON p.trade_id = t.id
+                ORDER BY p.created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     # Stats
     # ------------------------------------------------------------------
     def get_trade_stats(self) -> dict[str, Any]:
@@ -769,7 +859,7 @@ class Database:
             rows = conn.execute(
                 """
                 SELECT
-                    COALESCE(NULLIF(category, ''), SUBSTR(ticker, 1, 4)) AS cat,
+                    COALESCE(NULLIF(category, ''), SUBSTR(ticker, 1, 7)) AS cat,
                     ticker,
                     COUNT(*)                                              AS total,
                     SUM(CASE WHEN status='won'  THEN 1 ELSE 0 END)       AS wins,

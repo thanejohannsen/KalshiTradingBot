@@ -68,6 +68,12 @@ _TICKER_PREFIX_MAP: dict[str, str] = {
     "KXNA":  "WEATHER",
     "KXHU":  "WEATHER",
     "KXEQ":  "WEATHER",
+    "KXHIGH": "WEATHER",  # high temp markets (KXHIGHCHI, KXHIGHNYC, etc.)
+    "KXLOW":  "WEATHER",  # low temp markets
+    "KXRAIN": "WEATHER",
+    "KXSNOW": "WEATHER",
+    "KXWIND": "WEATHER",
+    "KXTEMP": "WEATHER",
     # Economics / Fed
     "KXFED": "ECONOMICS",
     "KXCPI": "ECONOMICS",
@@ -82,6 +88,7 @@ _TICKER_PREFIX_MAP: dict[str, str] = {
     "KXOSC": "ENTERTAINMENT",
     "KXMOV": "ENTERTAINMENT",
     "KXTVS": "ENTERTAINMENT",
+    "KXRT":  "ENTERTAINMENT",  # Rotten Tomatoes scores
     # Financials / Stocks
     "KXSP5": "FINANCIALS",
     "KXNAS": "FINANCIALS",
@@ -156,77 +163,91 @@ CODE_DEFAULT_PROFILES: dict[str, CategoryProfile] = {
         category="SPORTS",
         # Substantial inefficiency (2.23pp gap) — fan/underdog bias is
         # strong.  Sportsbook lines remain the dominant signal.
+        # CalibrationModel trained on resolved sports markets knows exactly
+        # where the favorite/underdog bias lives in the price curve.
         active_models={
-            "SportsbookModel":   0.40,  # primary signal — sharp-money consensus
-            "MarketAnchorModel": 0.25,  # respect Kalshi price partially
-            "MomentumModel":     0.20,  # price drift toward true value
-            "VolumeModel":       0.10,  # volume confirms direction
+            "CalibrationModel":  0.30,  # ML calibration — knows price bias curves
+            "SportsbookModel":   0.35,  # sharp-money consensus
+            "MarketAnchorModel": 0.10,  # anchor on market price
+            "MomentumModel":     0.12,  # price drift toward true value
+            "VolumeModel":       0.08,  # volume confirms direction
             "SentimentModel":    0.05,  # fan sentiment is noisy — minimal weight
         },
         sentiment_weight=0.06,
-        market_trust=0.45,          # ↓ less trust — retail fan bias
-        kelly_fraction=0.22,        # ↑ slightly — bias is exploitable
-        edge_threshold=0.012,       # ↓ lower bar — edges are real
+        market_trust=0.75,          # market is mostly right; edges come from sportsbook gap
+        kelly_fraction=0.20,
+        edge_threshold=0.015,       # require 1.5pp edge — small edges are noise
         preferred_signals=["volume_spike", "price_move"],
         ignored_signals=[],
     ),
     "POLITICS": CategoryProfile(
         category="POLITICS",
         # Moderate inefficiency (1.02pp gap) — tribalism introduces some
-        # bias but the market is heavily watched.
+        # bias but the market is heavily watched and fairly efficient.
         active_models={
-            "MarketAnchorModel": 0.35,
-            "SentimentModel":    0.25,
-            "ConsensusModel":    0.25,
+            "CalibrationModel":  0.30,  # ML calibration
+            "MarketAnchorModel": 0.15,
+            "SentimentModel":    0.20,
+            "ConsensusModel":    0.20,
             "MomentumModel":     0.15,
         },
-        sentiment_weight=0.12,
-        market_trust=0.55,
-        kelly_fraction=0.18,        # ↓ moderate — edges are smaller
-        edge_threshold=0.018,       # ↑ slightly — many perceived edges are tribal noise
+        sentiment_weight=0.10,
+        market_trust=0.80,          # heavily watched, mostly efficient
+        kelly_fraction=0.15,
+        edge_threshold=0.020,       # require 2pp — tribal noise creates false edges
         preferred_signals=["price_move", "volume_spike"],
         ignored_signals=[],
     ),
     "WEATHER": CategoryProfile(
         category="WEATHER",
+        # Model-driven markets — very efficient, minimal retail bias.
+        # CalibrationModel can confirm whether "efficient" means "perfectly
+        # calibrated" or just "small average gap" in weather specifically.
         active_models={
-            "MarketAnchorModel": 0.55,
-            "MomentumModel":     0.30,
+            "CalibrationModel":  0.25,  # ML calibration
+            "MarketAnchorModel": 0.40,
+            "MomentumModel":     0.20,
             "VolumeModel":       0.15,
         },
-        sentiment_weight=0.03,
-        market_trust=0.70,
-        kelly_fraction=0.15,
-        edge_threshold=0.020,
+        sentiment_weight=0.02,
+        market_trust=0.90,          # weather models price these well
+        kelly_fraction=0.10,
+        edge_threshold=0.025,       # high bar — edges are rare
         preferred_signals=["price_move"],
         ignored_signals=["wide_spread"],
     ),
     "ECONOMICS": CategoryProfile(
         category="ECONOMICS",
+        # Calendar-driven (Fed, CPI).  Market is efficient between events
+        # but can lag consensus shifts near release dates.
         active_models={
-            "MarketAnchorModel": 0.35,
-            "ConsensusModel":    0.30,
-            "SentimentModel":    0.20,
+            "CalibrationModel":  0.25,  # ML calibration
+            "MarketAnchorModel": 0.25,
+            "ConsensusModel":    0.20,
+            "SentimentModel":    0.15,
             "MomentumModel":     0.15,
         },
-        sentiment_weight=0.10,
-        market_trust=0.55,
-        kelly_fraction=0.22,
-        edge_threshold=0.015,
+        sentiment_weight=0.08,
+        market_trust=0.80,
+        kelly_fraction=0.15,
+        edge_threshold=0.020,       # require 2pp — econ markets are watched
         preferred_signals=["volume_spike", "divergence"],
         ignored_signals=[],
     ),
     "CRYPTO": CategoryProfile(
         category="CRYPTO",
+        # Fast-moving, correlated to live exchange prices.
+        # Kalshi crypto markets track spot closely — trust the market.
         active_models={
-            "MomentumModel":     0.35,
-            "VolumeModel":       0.30,
-            "MarketAnchorModel": 0.25,
+            "CalibrationModel":  0.25,  # ML calibration
+            "MarketAnchorModel": 0.20,
+            "MomentumModel":     0.25,
+            "VolumeModel":       0.20,
             "SentimentModel":    0.10,
         },
-        sentiment_weight=0.08,
-        market_trust=0.40,
-        kelly_fraction=0.15,
+        sentiment_weight=0.05,
+        market_trust=0.80,          # crypto markets track spot prices well
+        kelly_fraction=0.12,
         edge_threshold=0.025,
         preferred_signals=["volume_spike", "price_move", "divergence"],
         ignored_signals=[],
@@ -234,67 +255,71 @@ CODE_DEFAULT_PROFILES: dict[str, CategoryProfile] = {
     "ENTERTAINMENT": CategoryProfile(
         category="ENTERTAINMENT",
         # Most inefficient category (4.79pp maker-taker gap) — retail
-        # emotional engagement creates massive mispricing.  Lean into
-        # sentiment which IS informative here, and size up.
+        # emotional engagement creates mispricing.  CalibrationModel is
+        # especially valuable here — largest calibration gaps.
         active_models={
-            "MarketAnchorModel": 0.30,
-            "SentimentModel":    0.35,  # ↑ sentiment is the edge here
-            "ConsensusModel":    0.25,
+            "CalibrationModel":  0.35,  # ML calibration — biggest edge in this category
+            "SentimentModel":    0.25,  # sentiment is informative
+            "ConsensusModel":    0.20,
+            "MarketAnchorModel": 0.10,
             "VolumeModel":       0.10,
         },
-        sentiment_weight=0.18,      # ↑ sentiment highly predictive
-        market_trust=0.40,          # ↓ market is inefficient — trust it less
-        kelly_fraction=0.25,        # ↑ higher Kelly — bigger exploitable bias
-        edge_threshold=0.008,       # ↓ lower bar — edges are real here
+        sentiment_weight=0.15,
+        market_trust=0.65,          # least efficient category — more room for signals
+        kelly_fraction=0.20,
+        edge_threshold=0.015,       # require 1.5pp even here
         preferred_signals=["volume_spike"],
         ignored_signals=[],
     ),
     "FINANCIALS": CategoryProfile(
         category="FINANCIALS",
         # Near-efficient category (0.17pp gap) — professional traders
-        # dominate.  High edge threshold since perceived edges are likely
-        # noise.  Small Kelly since we're competing against quants.
+        # dominate.  CalibrationModel will confirm near-perfect calibration,
+        # so it mostly reinforces MarketAnchor here.
         active_models={
-            "MomentumModel":     0.40,
-            "MarketAnchorModel": 0.35,  # ↑ trust market more — it's efficient
-            "VolumeModel":       0.15,
+            "CalibrationModel":  0.20,  # ML calibration — confirms efficiency
+            "MarketAnchorModel": 0.30,
+            "MomentumModel":     0.30,
+            "VolumeModel":       0.10,
             "SentimentModel":    0.10,
         },
-        sentiment_weight=0.05,      # ↓ sentiment is noise here
-        market_trust=0.70,          # ↑ efficient market — trust it heavily
-        kelly_fraction=0.10,        # ↓ small size — edges are thin/illusory
-        edge_threshold=0.035,       # ↑ high bar — most "edges" are noise
+        sentiment_weight=0.03,
+        market_trust=0.90,          # near-efficient — trust market heavily
+        kelly_fraction=0.08,
+        edge_threshold=0.035,       # very high bar — most "edges" are noise
         preferred_signals=["price_move", "volume_spike", "divergence"],
         ignored_signals=[],
     ),
     "SCIENCE": CategoryProfile(
         category="SCIENCE",
         active_models={
-            "MarketAnchorModel": 0.40,
-            "ConsensusModel":    0.30,
-            "SentimentModel":    0.20,
-            "MomentumModel":     0.10,
+            "CalibrationModel":  0.25,  # ML calibration
+            "MarketAnchorModel": 0.25,
+            "ConsensusModel":    0.20,
+            "SentimentModel":    0.15,
+            "MomentumModel":     0.15,
         },
-        sentiment_weight=0.08,
-        market_trust=0.60,
-        kelly_fraction=0.20,
-        edge_threshold=0.015,
+        sentiment_weight=0.06,
+        market_trust=0.80,
+        kelly_fraction=0.15,
+        edge_threshold=0.020,
         preferred_signals=[],
         ignored_signals=[],
     ),
     "DEFAULT": CategoryProfile(
         category="DEFAULT",
         active_models={
-            "MarketAnchorModel": 0.30,
-            "SentimentModel":    0.20,
-            "MomentumModel":     0.20,
+            "CalibrationModel":  0.30,  # ML calibration
+            "MarketAnchorModel": 0.15,
+            "SentimentModel":    0.15,
+            "MomentumModel":     0.15,
             "VolumeModel":       0.15,
-            "ConsensusModel":    0.15,
+            "ConsensusModel":    0.10,
         },
-        sentiment_weight=0.10,
-        market_trust=0.50,
-        kelly_fraction=0.25,
-        edge_threshold=0.010,
+        sentiment_weight=0.08,
+        market_trust=0.80,          # trust market by default
+        kelly_fraction=0.15,
+        edge_threshold=0.020,       # require 2pp edge minimum
         preferred_signals=[],
         ignored_signals=[],
     ),

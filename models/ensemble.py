@@ -1,16 +1,25 @@
 """
 Ensemble Probability Model — C component of the B+C+E system.
 
-Five independent sub-models each estimate the true probability of YES.
+Sub-models each estimate the true probability of YES.
 The EnsembleProbabilityModel combines them with learned per-model weights.
 
 Sub-models
 ----------
-MarketAnchorModel  — Blends market price with a 50/50 prior based on market_trust.
+CalibrationModel   — ML model trained on 10,000+ resolved Kalshi markets.
+                     Highest-signal model — knows where markets systematically misprice.
+MarketAnchorModel  — Returns the market price as the baseline estimate.
 SentimentModel     — Adjusts probability based on external sentiment.
 MomentumModel      — Uses price movement from baseline to detect directional drift.
 VolumeModel        — High volume spikes confirm the current market direction.
 ConsensusModel     — Uses bullish vs bearish source agreement from research.
+SportsbookModel    — Uses sportsbook lines as an independent pricing signal.
+
+DESIGN PRINCIPLE: The market price is assumed correct by default.  Edges
+come ONLY from information signals (calibration model, sentiment, sportsbook
+data, momentum) that move the estimate away from market price.  No model
+should pull prices toward 50% — that creates phantom edges on every
+non-50c contract.
 
 Weight learning
 ---------------
@@ -46,24 +55,27 @@ _CONF_MULT: dict[str, float] = {"high": 1.0, "medium": 0.6, "low": 0.3}
 
 class MarketAnchorModel:
     """
-    Trusts the market-implied probability, blended toward 50/50 by market_trust.
+    Returns the market-implied probability as the baseline estimate.
 
-    Formula:
-        prob = market_trust * market_prob + (1 - market_trust) * 0.5
+    The market price IS the anchor.  This model does NOT blend toward 50%.
+    That old formula (trust * market + (1-trust) * 0.50) created phantom
+    edges on every contract not near 50c — a 5c contract got predicted
+    at 30c, showing a fake +25% edge.
 
-    Rationale: Kalshi markets are generally efficient.  A high market_trust
-    means we respect the crowd wisdom; a lower value leaves room for other
-    models to move the estimate.
+    Now: prob = market_prob.  Period.  Confidence scales with market_trust
+    so that in efficient categories (FINANCIALS, trust=0.85) this model
+    dominates the ensemble and prevents other models from moving the
+    estimate far.  In less efficient categories (ENTERTAINMENT, trust=0.55)
+    it has less weight, letting sentiment/sportsbook models contribute.
     """
 
     name = "MarketAnchorModel"
 
     def estimate(self, inputs: dict[str, Any]) -> dict[str, Any]:
         mp = inputs["market_probability"]
-        trust = inputs.get("market_trust", 0.5)
-        prob = trust * mp + (1.0 - trust) * 0.5
-        confidence = 0.7  # always has a view
-        return {"model": self.name, "probability": _clamp(prob), "confidence": confidence}
+        trust = inputs.get("market_trust", 0.70)
+        confidence = trust  # high trust = high confidence in market price
+        return {"model": self.name, "probability": _clamp(mp), "confidence": confidence}
 
 
 class SentimentModel:
@@ -72,9 +84,10 @@ class SentimentModel:
 
     Formula:
         shift = sentiment_score * sentiment_weight * confidence_multiplier
-        prob  = market_prob + shift
+        prob  = market_prob + shift  (capped at ±3pp)
 
     High narrative confidence amplifies the shift; low confidence dampens it.
+    Returns market_prob (confidence=0) when sentiment data is weak.
     """
 
     name = "SentimentModel"
@@ -87,11 +100,12 @@ class SentimentModel:
         mult = _CONF_MULT.get(conf, 0.3)
 
         shift = sent * sw * mult
+        # Cap at ±3pp — sentiment alone shouldn't create a large edge
+        shift = max(-0.03, min(0.03, shift))
         prob = mp + shift
 
-        # Confidence is derived from sentiment strength × narrative confidence
         raw_conf = abs(sent) * mult
-        confidence = min(0.9, max(0.1, raw_conf))
+        confidence = min(0.6, max(0.05, raw_conf))
         return {"model": self.name, "probability": _clamp(prob), "confidence": confidence}
 
 
@@ -200,10 +214,10 @@ class ConsensusModel:
 
     Formula:
         consensus_score = (bullish_pct - bearish_pct)   # -1 to +1 range
-        consensus_adj   = consensus_score * 0.08
+        consensus_adj   = consensus_score * 0.05  (capped at ±4pp)
         prob = market_prob + consensus_adj
 
-    More data points → higher confidence in the consensus.
+    Requires 5+ data points to have meaningful confidence.
     """
 
     name = "ConsensusModel"
@@ -214,14 +228,14 @@ class ConsensusModel:
         bearish_pct = inputs.get("bearish_pct", 0.0) or 0.0
         data_points = inputs.get("data_point_count", 0) or 0
 
-        if data_points < 3:
-            return {"model": self.name, "probability": _clamp(mp), "confidence": 0.1}
+        if data_points < 5:
+            return {"model": self.name, "probability": _clamp(mp), "confidence": 0.05}
 
         consensus = bullish_pct - bearish_pct          # -1.0 to +1.0
-        consensus_adj = max(-0.08, min(0.08, consensus * 0.08))
+        consensus_adj = max(-0.04, min(0.04, consensus * 0.05))
         prob = mp + consensus_adj
 
-        confidence = min(0.8, data_points / 30.0)
+        confidence = min(0.6, data_points / 40.0)
         return {"model": self.name, "probability": _clamp(prob), "confidence": confidence}
 
 
@@ -237,6 +251,21 @@ _ALL_MODELS: dict[str, Any] = {
     "ConsensusModel":    ConsensusModel(),
     "SportsbookModel":   SportsbookModel(),
 }
+
+# CalibrationModel is optional — only registered if the trained model exists.
+# This avoids import errors when lightgbm/joblib aren't installed.
+try:
+    from models.calibration import CalibrationModel as _CalibModel
+    if _CalibModel().estimate({"market_probability": 0.5}).get("confidence", 0) > 0:
+        _ALL_MODELS["CalibrationModel"] = _CalibModel()
+        logger.info("CalibrationModel registered in ensemble (ML model loaded)")
+    else:
+        _ALL_MODELS["CalibrationModel"] = _CalibModel()
+        logger.info("CalibrationModel registered (model file not yet trained — will return market price)")
+except ImportError:
+    logger.info("CalibrationModel not available (lightgbm/joblib not installed)")
+except Exception as exc:
+    logger.warning("CalibrationModel failed to load: %s", exc)
 
 
 class EnsembleProbabilityModel:
